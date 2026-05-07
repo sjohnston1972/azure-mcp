@@ -59,7 +59,7 @@ export function NewProjectModal({ open, onClose, onCreate }: Props) {
             New project
           </h2>
           <p className="text-xs text-on-surface-variant mt-0.5">
-            The name becomes the <code className="font-mono">azure-mcp-project</code>{" "}
+            The name becomes the <code className="font-mono">mcp-project</code>{" "}
             tag on every resource you deploy.
           </p>
         </div>

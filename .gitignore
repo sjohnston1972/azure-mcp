@@ -35,6 +35,10 @@ postgres-data/
 # ─── Local Compose overrides (committed copy is .yml.example) ─────
 docker-compose.override.yml
 
+# ─── Screenshot tooling artefacts (the script itself is checked in) ─
+docs/screenshots/node_modules
+docs/screenshots/package*.json
+
 # ─── Misc ─────────────────────────────────────────────────────────
 .tmp/
 tmp/

@@ -381,7 +381,7 @@ function AppInner() {
                 <>
                   This deletes every Azure resource tagged with{" "}
                   <code className="font-mono text-[12px] px-1 py-0.5 rounded bg-surface-container-high">
-                    azure-mcp-topology-id={t.id.slice(0, 8)}…
+                    mcp-topology-id={t.id.slice(0, 8)}…
                   </code>
                   . Resources from <strong>other topologies</strong> in this
                   project stay alive. The topology record stays for audit;

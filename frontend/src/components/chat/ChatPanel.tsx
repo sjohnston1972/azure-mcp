@@ -18,7 +18,7 @@ type Props = {
   projectName: string | null;
   projectId: string | null;
   /** Active topology id — sent with every chat turn so Claude tags
-   *  resources with `azure-mcp-topology-id=<id>` and per-topology
+   *  resources with `mcp-topology-id=<id>` and per-topology
    *  destroy can target precisely. */
   activeTopologyId: string | null;
   activeTopologyName: string | null;
@@ -188,13 +188,13 @@ export function ChatPanel({
         <>
           This will create <strong>live Azure resources</strong>, tagged with{" "}
           <code className="font-mono text-[12px] px-1 py-0.5 rounded bg-surface-container-high">
-            azure-mcp-project={projectName}
+            mcp-project={projectName}
           </code>
           {activeTopologyId && (
             <>
               {" "}and{" "}
               <code className="font-mono text-[12px] px-1 py-0.5 rounded bg-surface-container-high">
-                azure-mcp-topology-id={activeTopologyId.slice(0, 8)}…
+                mcp-topology-id={activeTopologyId.slice(0, 8)}…
               </code>
             </>
           )}
@@ -227,7 +227,7 @@ export function ChatPanel({
         <>
           This deletes <strong>every</strong> Azure resource tagged with{" "}
           <code className="font-mono text-[12px] px-1 py-0.5 rounded bg-surface-container-high">
-            azure-mcp-project={projectName}
+            mcp-project={projectName}
           </code>
           , including resources from <strong>every topology</strong> in this
           project. To destroy a single topology only, use the Destroy
