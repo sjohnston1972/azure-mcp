@@ -36,6 +36,7 @@ import type {
   TopologyRecord,
 } from "./lib/types";
 import type { Topology } from "./lib/parse-topology";
+import { inferTopologyName } from "./lib/infer-name";
 
 const ACTIVE_PROJECT_KEY = "azure-mcp:active-project-id";
 const activeTopologyKey = (projectId: string) =>
@@ -242,7 +243,8 @@ function AppInner() {
       topologyAtTurn: Topology | null,
       bicepAtTurn: string | null,
       teardownTargetId: string | null,
-      errored: boolean
+      errored: boolean,
+      userPrompt: string
     ) => {
       if (!current) return;
       try {
@@ -278,18 +280,36 @@ function AppInner() {
 
         if (stage === "build" && (topologyAtTurn || bicepAtTurn)) {
           if (!activeTopologyId) {
-            // First topology in the project — create it.
+            // First topology in the project — create it. Auto-name
+            // from the user's prompt (≤16 chars) so the rail is
+            // immediately readable instead of "untitled-N".
+            const inferredName = userPrompt
+              ? inferTopologyName(userPrompt)
+              : undefined;
             const created = await createTopology({
               project_id: current.id,
+              ...(inferredName ? { name: inferredName } : {}),
               ...(topologyAtTurn ? { topology: topologyAtTurn } : {}),
               ...(bicepAtTurn ? { bicep: bicepAtTurn } : {}),
             });
             setTopologies((cur) => [created, ...cur]);
             setActiveTopologyId(created.id);
           } else {
+            // If the active topology still has the default
+            // "untitled-N" name (placeholder from + New topology),
+            // rename it from the user's prompt at the same time as
+            // we persist the build content. Don't touch user-renamed
+            // topologies.
+            const active = topologies.find((t) => t.id === activeTopologyId);
+            const isPlaceholderName = !!active?.name && /^untitled-\d+$/.test(active.name);
+            const inferredName =
+              isPlaceholderName && userPrompt
+                ? inferTopologyName(userPrompt)
+                : null;
             const updated = await patchTopology(activeTopologyId, {
               ...(topologyAtTurn ? { topology: topologyAtTurn } : {}),
               ...(bicepAtTurn ? { bicep: bicepAtTurn } : {}),
+              ...(inferredName ? { name: inferredName } : {}),
             });
             setTopologies((cur) =>
               cur.map((t) => (t.id === updated.id ? updated : t))
@@ -304,7 +324,7 @@ function AppInner() {
         console.error("[persistBuildAfterTurn]", err);
       }
     },
-    [current, activeTopologyId]
+    [current, activeTopologyId, topologies]
   );
 
   // ── Live state mutators (no persistence yet — that's per turn) ──

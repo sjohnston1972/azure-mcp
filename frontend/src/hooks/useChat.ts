@@ -23,8 +23,15 @@ type Callbacks = {
   onBicep?: (b: string) => void;
   /** Fires when an assistant turn fully completes. `errored` is true
    *  if any tool call this turn returned is_error — used to decide
-   *  whether a push succeeded (status=live) or failed (status=failed). */
-  onTurnComplete?: (info: { stage: Stage; errored: boolean }) => void;
+   *  whether a push succeeded (status=live) or failed (status=failed).
+   *  `userPrompt` is the text the user sent on the turn that triggered
+   *  this assistant response — used to auto-name newly-created
+   *  topologies on first build. */
+  onTurnComplete?: (info: {
+    stage: Stage;
+    errored: boolean;
+    userPrompt: string;
+  }) => void;
 };
 
 function buildPushPrompt(
@@ -270,7 +277,11 @@ export function useChat(cb: Callbacks = {}) {
               // died AND nothing useful happened.
               errored = streamErrored && toolResults.every((t) => t.isError);
             }
-            cbRef.current.onTurnComplete?.({ stage, errored });
+            cbRef.current.onTurnComplete?.({
+              stage,
+              errored,
+              userPrompt: text,
+            });
           }
         }
       } catch (e) {

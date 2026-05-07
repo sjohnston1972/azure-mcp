@@ -43,13 +43,16 @@ type Props = {
    *  the topology + bicep to the backend (creating or PATCHing the
    *  active record), and to flip topology status on push/teardown.
    *  `errored` is true if any tool call returned is_error this turn —
-   *  used to mark a failed push as `failed` rather than `live`. */
+   *  used to mark a failed push as `failed` rather than `live`.
+   *  `userPrompt` is the text that triggered this turn — used to
+   *  auto-name a new topology on first build. */
   onTurnComplete: (
     stage: string,
     topology: Topology | null,
     bicep: string | null,
     teardownTargetId: string | null,
-    errored: boolean
+    errored: boolean,
+    userPrompt: string
   ) => void;
 };
 
@@ -91,7 +94,7 @@ export function ChatPanel({
       turnBicepRef.current = b;
       onBicepChange(b);
     },
-    onTurnComplete: ({ stage, errored }) => {
+    onTurnComplete: ({ stage, errored, userPrompt }) => {
       // Only flip the local "pushed" flag on a successful push.
       if (stage === "push" && !errored) onPushed();
       if (stage === "teardown" && !errored) onTorndown();
@@ -100,7 +103,8 @@ export function ChatPanel({
         turnTopologyRef.current,
         turnBicepRef.current,
         turnTeardownTargetRef.current,
-        errored
+        errored,
+        userPrompt
       );
       // Reset per-turn capture refs.
       turnTopologyRef.current = null;
