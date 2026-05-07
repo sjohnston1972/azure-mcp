@@ -370,6 +370,21 @@ async function runBicepDeploy(input: DeployBicepInput): Promise<{
   const filename = `${id}.bicep`;
   const hostPath = join(WORKSPACE, filename);
 
+  // 0. Defence-in-depth pre-validate. Even if Claude skipped
+  // validate_bicep during the build phase, we re-check at push time
+  // so we never ship a template that doesn't compile. Fail fast with
+  // the compile errors so Claude can revise on the next turn.
+  const preValidate = await runValidateBicep({ bicep: input.bicep });
+  if (preValidate.is_error) {
+    return {
+      content:
+        "# deploy_bicep — pre-flight validation FAILED\n\n" +
+        "The template did not compile. Fix the errors below, then call deploy_bicep again with the corrected Bicep.\n\n" +
+        preValidate.content,
+      is_error: true,
+    };
+  }
+
   // 1. Write the template to the shared workspace volume.
   await writeFile(hostPath, input.bicep, "utf8");
 

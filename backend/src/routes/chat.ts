@@ -55,6 +55,20 @@ const STAGE_GUARD: Record<ChatStage, string> = {
 // Maximum number of agentic loop turns. Stops a runaway tool spiral.
 const MAX_TURNS = 25;
 
+// Anthropic SDK call timeout — single API turn (one streamed response
+// from Claude). Hub-and-spoke planning + Bicep generation is the
+// largest case we've seen; 5 minutes is generous.
+const ANTHROPIC_TIMEOUT_MS = 5 * 60 * 1000;
+
+// Hard ceiling on the entire chat loop (all turns + all tool calls).
+// deploy_bicep and destroy_azure can take several minutes each.
+const TOTAL_TURN_TIMEOUT_MS = 30 * 60 * 1000;
+
+// SSE keepalive interval — empty comment lines that nginx / browsers
+// won't time out on. SSE comments (lines starting with `:`) are
+// silently ignored by parsers.
+const KEEPALIVE_MS = 15_000;
+
 export async function chatRoutes(app: FastifyInstance) {
   app.post<{ Body: ChatBody }>("/api/chat", async (req, reply) => {
     const body = req.body;
@@ -74,6 +88,43 @@ export async function chatRoutes(app: FastifyInstance) {
       reply.raw.write(`event: ${event}\n`);
       reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
     };
+
+    // ── Keepalive heartbeat ──────────────────────────────────────
+    // SSE comments (lines starting with `:`) are silently ignored by
+    // parsers but keep nginx, Cloudflare, and the browser fetch alive
+    // during long quiet periods (e.g. while deploy_bicep is running
+    // a 2-3 minute az deployment). Without this, intermediate proxies
+    // can drop the connection and the user sees a cryptic "Error in
+    // input stream".
+    const keepalive = setInterval(() => {
+      try {
+        reply.raw.write(`: keepalive ${Date.now()}\n\n`);
+      } catch {
+        /* connection already gone */
+      }
+    }, KEEPALIVE_MS);
+
+    // ── Hard total-turn timeout ──────────────────────────────────
+    // If the loop hangs (Anthropic SDK stuck, MCP child wedged,
+    // anything else), forcibly abort after TOTAL_TURN_TIMEOUT_MS so
+    // the request finishes with a clear error rather than sitting
+    // forever and accumulating dead handlers.
+    const turnAbort = new AbortController();
+    const turnTimeout = setTimeout(() => {
+      app.log.error(
+        { request_url: req.url },
+        `[chat] hard timeout after ${TOTAL_TURN_TIMEOUT_MS}ms — aborting`
+      );
+      turnAbort.abort();
+    }, TOTAL_TURN_TIMEOUT_MS);
+
+    // Clean up both timers no matter how the request ends.
+    const cleanup = () => {
+      clearInterval(keepalive);
+      clearTimeout(turnTimeout);
+    };
+    reply.raw.on("close", cleanup);
+    reply.raw.on("finish", cleanup);
 
     // Local mutable copy of the conversation; we append assistant turns
     // and tool-result user turns as the agentic loop progresses.
@@ -154,18 +205,47 @@ export async function chatRoutes(app: FastifyInstance) {
       let stopReason: Anthropic.Message["stop_reason"] = null;
 
       for (let turn = 0; turn < MAX_TURNS; turn++) {
-        const stream = anthropic.messages.stream({
-          model: config.ANTHROPIC_MODEL,
-          max_tokens: 16000,
-          system: systemBlocks,
-          tools,
-          messages,
+        if (turnAbort.signal.aborted) {
+          sse("error", {
+            message: `Chat turn aborted after ${TOTAL_TURN_TIMEOUT_MS / 1000}s — see backend logs.`,
+          });
+          break;
+        }
+
+        // Per-call abort so a single Anthropic stream that wedges
+        // (rare but observed) doesn't take down the whole turn.
+        const callAbort = new AbortController();
+        const callTimeout = setTimeout(
+          () => callAbort.abort(),
+          ANTHROPIC_TIMEOUT_MS
+        );
+        // Bridge the parent abort so a hard timeout aborts mid-call.
+        const onParentAbort = () => callAbort.abort();
+        turnAbort.signal.addEventListener("abort", onParentAbort, {
+          once: true,
         });
+
+        const stream = anthropic.messages.stream(
+          {
+            model: config.ANTHROPIC_MODEL,
+            max_tokens: 16000,
+            system: systemBlocks,
+            tools,
+            messages,
+          },
+          { signal: callAbort.signal }
+        );
 
         // Forward text deltas to the client as they arrive.
         stream.on("text", (delta) => sse("text", { delta }));
 
-        const message = await stream.finalMessage();
+        let message;
+        try {
+          message = await stream.finalMessage();
+        } finally {
+          clearTimeout(callTimeout);
+          turnAbort.signal.removeEventListener("abort", onParentAbort);
+        }
         stopReason = message.stop_reason;
 
         if (stopReason === "end_turn" || stopReason === "stop_sequence") {
@@ -218,10 +298,18 @@ export async function chatRoutes(app: FastifyInstance) {
       sse("done", { stop_reason: stopReason });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const detail = turnAbort.signal.aborted
+        ? `Hard timeout (${TOTAL_TURN_TIMEOUT_MS / 1000}s) — ${message}`
+        : message;
       app.log.error({ err }, "chat loop failed");
-      sse("error", { message });
+      sse("error", { message: detail });
     } finally {
-      reply.raw.end();
+      cleanup();
+      try {
+        reply.raw.end();
+      } catch {
+        /* connection may already be closed */
+      }
     }
 
     return reply;
