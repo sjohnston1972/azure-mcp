@@ -1,0 +1,105 @@
+# azure-mcp — production compose.
+#
+# All four services attach to the existing external `net_core` network
+# (same network the rest of Steven's homelab uses). Cloudflare's tunnel
+# container is already on net_core and reaches azure-mcp-frontend:80
+# directly — no host ports are published here.
+#
+# For local-only dev (no tunnel) copy docker-compose.override.yml.example
+# → docker-compose.override.yml. Compose merges it automatically.
+
+services:
+  # ── Frontend (React+Vite, served by nginx) ─────────────────────────
+  azure-mcp-frontend:
+    container_name: azure-mcp-frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - azure-mcp-backend
+    networks:
+      - net_core
+    # No ports: published. The Cloudflare tunnel reaches us by container
+    # name on net_core. nginx serves the SPA on :80 and proxies /api/* to
+    # azure-mcp-backend:3000.
+
+  # ── Backend (Node+Fastify+TypeScript, the orchestrator) ────────────
+  #
+  # The backend spawns Microsoft's Azure MCP Server as a child process
+  # via `docker run -i --rm ... mcr.microsoft.com/azure-sdk/azure-mcp
+  # --transport=stdio` and talks to it over stdio (per Microsoft's
+  # primary documented usage pattern). That's why we mount the Docker
+  # socket here and install docker-cli inside the backend image.
+  #
+  # We tried running azure-mcp as a sibling container with
+  # --transport=http, but 3.0.0-beta.9 has two blockers: the
+  # auth-disable flag silently crashes startup, and the OAuth Protected
+  # Resource Metadata it advertises points at a malformed tenant URL.
+  # See DECISIONS.md "Azure MCP transport" for details.
+  azure-mcp-backend:
+    container_name: azure-mcp-backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      # Image the backend will pull/run when it spawns the MCP server.
+      AZURE_MCP_IMAGE: mcr.microsoft.com/azure-sdk/azure-mcp:latest
+    volumes:
+      # Docker socket: lets the backend spawn the MCP container as a
+      # sibling on the host engine. Single-user homelab tool — the
+      # security trade-off (socket access = root on host) is acceptable.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Workspace volume: backend writes Bicep templates here, the
+      # spawned azure-cli container mounts the same volume to read
+      # them for `az deployment ... create -f /work/<id>.bicep`.
+      - azure-mcp-deploy-workspace:/work
+    depends_on:
+      azure-mcp-db:
+        condition: service_healthy
+    networks:
+      - net_core
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Postgres (projects, deployments, templates) ────────────────────
+  azure-mcp-db:
+    container_name: azure-mcp-db
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - azure-mcp-db-data:/var/lib/postgresql/data
+      # init.sql runs once on first boot of an empty data volume.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - net_core
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  azure-mcp-db-data:
+  # Shared workspace between the backend container and the spawned
+  # azure-cli sidecar that runs `az deployment ... create`. Lives on
+  # the host at the docker-managed volume path; both containers mount
+  # it at /work.
+  azure-mcp-deploy-workspace:
+
+networks:
+  net_core:
+    external: true

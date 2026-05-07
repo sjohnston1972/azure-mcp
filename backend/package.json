@@ -1,0 +1,32 @@
+{
+  "name": "azure-mcp-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backend orchestrator for azure-mcp. Bridges the chat UI, the Anthropic Messages API, and Microsoft's Azure MCP Server.",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p .",
+    "start": "node dist/server.js",
+    "typecheck": "tsc -p . --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@fastify/cors": "^10.0.1",
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "fastify": "^5.1.0",
+    "node-cron": "^3.0.3",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/node-cron": "^3.0.11",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,21 @@
+# Local-only dev overrides.
+#
+# Copy this file to `docker-compose.override.yml` to publish ports on
+# localhost so you can hit the SPA without going through the Cloudflare
+# tunnel. Compose merges override files automatically.
+#
+# `docker-compose.override.yml` itself is gitignored — keep your local
+# tweaks here without leaking them upstream.
+
+services:
+  azure-mcp-frontend:
+    ports:
+      - "8080:80"
+
+  azure-mcp-backend:
+    ports:
+      - "3000:3000"
+
+  azure-mcp-db:
+    ports:
+      - "5432:5432"

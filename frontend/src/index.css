@@ -1,0 +1,90 @@
+/*
+ * Tailwind v4: configuration lives in CSS via the @theme block.
+ * Colour tokens are lifted verbatim from netbud/frontend/src/index.css
+ * so the two tools share a visual family.
+ */
+
+@import "tailwindcss";
+
+@theme {
+  /* ── Material Design 3 palette (matches netbud) ─────────────── */
+  --color-primary: #0059bb;
+  --color-primary-container: #0070ea;
+  --color-on-primary: #ffffff;
+  --color-inverse-primary: #a3c8ff;
+
+  --color-secondary: #006c4f;
+  --color-on-secondary: #ffffff;
+
+  --color-tertiary: #585c61;
+  --color-on-tertiary: #ffffff;
+
+  --color-error: #ba1a1a;
+  --color-on-error: #ffffff;
+
+  --color-surface: #f8f9fa;
+  --color-surface-bright: #f8f9fa;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #f3f4f5;
+  --color-surface-container: #edeeef;
+  --color-surface-container-high: #e7e8e9;
+  --color-surface-container-highest: #e1e3e4;
+
+  --color-on-surface: #191c1d;
+  --color-on-surface-variant: #414754;
+
+  --color-outline: #717786;
+  --color-outline-variant: #c1c6d7;
+
+  --color-inverse-surface: #2e3133;
+  --color-inverse-on-surface: #f0f1f2;
+
+  /* ── Type ───────────────────────────────────────────────────── */
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* ── Base styles ──────────────────────────────────────────────── */
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-surface);
+  color: var(--color-on-surface);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Material Symbols sizing tweak so icons inherit the surrounding font
+   size when used inline with text. */
+.material-symbols-outlined {
+  font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
+  vertical-align: middle;
+  font-size: 1.25em;
+  line-height: 1;
+}
+
+/* Workbench grid — used as the topology canvas background.
+   Lifted from netbud's DesignCompose so the canvas reads as part of
+   the same family of tools. */
+.workbench-grid {
+  background-image: radial-gradient(var(--color-outline-variant) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+/* Subtle frosted-glass panel — used for modal/dialog backgrounds. */
+.glass-panel {
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+}
+
+/* Typing-dot animation reused for streaming chat indicators. */
+@keyframes typing-dot {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.35; }
+  30% { transform: translateY(-3px); opacity: 1; }
+}
+
+.animate-typing-dot { animation: typing-dot 1.2s infinite ease-in-out; }
