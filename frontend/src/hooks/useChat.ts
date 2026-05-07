@@ -129,11 +129,16 @@ export function useChat(cb: Callbacks = {}) {
       let assistantText = "";
       let topologyEmitted: Topology | null = null;
       let bicepEmitted: string | null = null;
-      // Track every tool result this turn. Final success status
-      // depends on the LAST tool call's outcome — Claude often retries
-      // a failed deploy_bicep / destroy_azure with corrections, and a
-      // self-recovered turn should be considered successful overall.
-      const toolResults: { id: string; isError: boolean }[] = [];
+      // Track every tool result this turn AND the tool name. Final
+      // success state depends on the LAST tool call's outcome — Claude
+      // often retries a failed deploy_bicep / destroy_azure, and a
+      // self-recovered turn is overall successful. Stream-level errors
+      // (Anthropic SSE hiccups, network drops) do NOT count as tool
+      // failures — if deploy_bicep returned success and the stream
+      // dies after that, Azure is still live and we mark the topology
+      // accordingly.
+      const toolResults: { id: string; name: string; isError: boolean }[] = [];
+      let streamErrored = false;
 
       const updateAssistant = (
         mut: (blocks: AssistantBlock[]) => AssistantBlock[]
@@ -190,6 +195,10 @@ export function useChat(cb: Callbacks = {}) {
               name: string;
               input: unknown;
             };
+            // Pre-record at tool_use time so we have the name even if
+            // the tool_result event never lands (e.g. stream cuts off).
+            // Defaulted to errored=true; flipped on tool_result.
+            toolResults.push({ id, name, isError: true });
             updateAssistant((blocks) => [
               ...blocks,
               {
@@ -206,7 +215,8 @@ export function useChat(cb: Callbacks = {}) {
               id: string;
               is_error: boolean;
             };
-            toolResults.push({ id, isError: Boolean(is_error) });
+            const entry = toolResults.find((t) => t.id === id);
+            if (entry) entry.isError = Boolean(is_error);
             updateAssistant((blocks) =>
               blocks.map((b) =>
                 b.type === "tool" && b.id === id
@@ -216,10 +226,16 @@ export function useChat(cb: Callbacks = {}) {
             );
           } else if (evt.event === "error") {
             const { message } = JSON.parse(evt.data) as { message: string };
-            setError(message);
-            // Stream-level errors mean the turn didn't finish cleanly.
-            // Record as a synthetic failed result so onTurnComplete sees it.
-            toolResults.push({ id: "__stream_error__", isError: true });
+            streamErrored = true;
+            // Suppress alarming red error pill if a deploy/destroy
+            // already succeeded this turn — Azure is live, the stream
+            // hiccup after that is noise.
+            const succeededAt = toolResults.some(
+              (t) =>
+                !t.isError &&
+                (t.name === "deploy_bicep" || t.name === "destroy_azure")
+            );
+            if (!succeededAt) setError(message);
           } else if (evt.event === "done") {
             setDisplay((d) =>
               d.map((m) =>
@@ -228,12 +244,32 @@ export function useChat(cb: Callbacks = {}) {
                   : m
               )
             );
-            // The LAST tool result determines the turn's success state.
-            // Claude often retries a failed deploy_bicep with corrections;
-            // if the second attempt succeeds, the turn overall succeeded.
-            // If no tool calls happened (e.g. Claude refused), no errored.
-            const last = toolResults[toolResults.length - 1];
-            const errored = last ? last.isError : false;
+            // Errored decision (used to flip topology status):
+            //   1. For push: did the LAST deploy_bicep call succeed?
+            //      Yes  → not errored (live).
+            //      No   → errored (failed).
+            //      None → not errored, but persistBuildAfterTurn skips
+            //             the status flip since the deploy never started.
+            //   2. For teardown: same logic for destroy_azure.
+            //   3. For build/free: errored = stream-level error AND no
+            //      relevant tool succeeded (rare — only matters if a
+            //      build turn died completely).
+            //
+            // Stream-level errors AFTER a successful deploy/destroy do
+            // NOT count as a turn failure — the resources are live, the
+            // stream cutting off is just noise.
+            const lastDeploy = [...toolResults].reverse().find((t) => t.name === "deploy_bicep");
+            const lastDestroy = [...toolResults].reverse().find((t) => t.name === "destroy_azure");
+            let errored = false;
+            if (stage === "push") {
+              errored = lastDeploy ? lastDeploy.isError : false;
+            } else if (stage === "teardown") {
+              errored = lastDestroy ? lastDestroy.isError : false;
+            } else {
+              // build / view / free — only mark errored if the stream
+              // died AND nothing useful happened.
+              errored = streamErrored && toolResults.every((t) => t.isError);
+            }
             cbRef.current.onTurnComplete?.({ stage, errored });
           }
         }
