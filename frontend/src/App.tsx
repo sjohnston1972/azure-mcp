@@ -37,6 +37,7 @@ import type {
 } from "./lib/types";
 import type { Topology } from "./lib/parse-topology";
 import { inferTopologyName } from "./lib/infer-name";
+import type { TurnOutcome } from "./hooks/useChat";
 
 const ACTIVE_PROJECT_KEY = "azure-mcp:active-project-id";
 const activeTopologyKey = (projectId: string) =>
@@ -243,16 +244,17 @@ function AppInner() {
       topologyAtTurn: Topology | null,
       bicepAtTurn: string | null,
       teardownTargetId: string | null,
-      errored: boolean,
+      outcome: TurnOutcome,
       userPrompt: string
     ) => {
       if (!current) return;
       try {
         if (stage === "teardown" && teardownTargetId) {
-          // Per-topology destroy → only mark destroyed if it succeeded.
-          // On error, leave the status as it was (likely 'live') so
-          // the user can retry.
-          if (errored) return;
+          // Per-topology destroy → only mark destroyed on a fully
+          // resolved success. On failure, leave status alone (user
+          // can retry). On 'incomplete' (stream died mid-tool), also
+          // leave status alone — Azure may still be processing.
+          if (outcome !== "success") return;
           const updated = await patchTopology(teardownTargetId, {
             status: "destroyed",
             topology: { nodes: [], edges: [] },
@@ -264,11 +266,20 @@ function AppInner() {
         }
 
         if (stage === "push" && activeTopologyId) {
-          // Push outcome → live on success, failed on error. Either way,
-          // persist the topology+bicep so the rail reflects the current
-          // design (Claude may have updated nodes mid-attempt).
+          // Push outcome:
+          //   - success    → flip to live, persist topology+bicep
+          //   - failed     → flip to failed, persist topology+bicep
+          //   - incomplete → DON'T flip status (stream died mid-call,
+          //                  Azure may still be deploying — user
+          //                  should check the portal). Do still
+          //                  persist the topology+bicep.
+          const statusUpdate: { status?: "live" | "failed" } = {};
+          if (outcome === "success") statusUpdate.status = "live";
+          else if (outcome === "failed") statusUpdate.status = "failed";
+          // outcome === "incomplete" → leave status alone
+
           const updated = await patchTopology(activeTopologyId, {
-            status: errored ? "failed" : "live",
+            ...statusUpdate,
             ...(topologyAtTurn ? { topology: topologyAtTurn } : {}),
             ...(bicepAtTurn ? { bicep: bicepAtTurn } : {}),
           });

@@ -3,7 +3,7 @@
 // to the parent (App), which holds per-project build state.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useChat } from "../../hooks/useChat";
+import { useChat, type TurnOutcome } from "../../hooks/useChat";
 import { parseAnswers } from "../../lib/parse-answers";
 import type { BuildState } from "../../lib/types";
 import type { Topology } from "../../lib/parse-topology";
@@ -42,8 +42,14 @@ type Props = {
   /** Fires after every assistant turn ends. App uses this to persist
    *  the topology + bicep to the backend (creating or PATCHing the
    *  active record), and to flip topology status on push/teardown.
-   *  `errored` is true if any tool call returned is_error this turn —
-   *  used to mark a failed push as `failed` rather than `live`.
+   *
+   *  `outcome` is the per-stage result:
+   *    - "success"    → push/teardown's relevant tool resolved OK
+   *    - "failed"     → resolved with is_error
+   *    - "incomplete" → stream died before tool_result, or the relevant
+   *                     tool was never called (don't flip status)
+   *    - "noop"       → stage doesn't flip status (build/view/free)
+   *
    *  `userPrompt` is the text that triggered this turn — used to
    *  auto-name a new topology on first build. */
   onTurnComplete: (
@@ -51,7 +57,7 @@ type Props = {
     topology: Topology | null,
     bicep: string | null,
     teardownTargetId: string | null,
-    errored: boolean,
+    outcome: TurnOutcome,
     userPrompt: string
   ) => void;
 };
@@ -94,16 +100,17 @@ export function ChatPanel({
       turnBicepRef.current = b;
       onBicepChange(b);
     },
-    onTurnComplete: ({ stage, errored, userPrompt }) => {
-      // Only flip the local "pushed" flag on a successful push.
-      if (stage === "push" && !errored) onPushed();
-      if (stage === "teardown" && !errored) onTorndown();
+    onTurnComplete: ({ stage, outcome, userPrompt }) => {
+      // Only flip the local "pushed" / "torndown" flags on a fully
+      // resolved success — leave them alone on failed or incomplete.
+      if (stage === "push" && outcome === "success") onPushed();
+      if (stage === "teardown" && outcome === "success") onTorndown();
       onTurnComplete(
         stage,
         turnTopologyRef.current,
         turnBicepRef.current,
         turnTeardownTargetRef.current,
-        errored,
+        outcome,
         userPrompt
       );
       // Reset per-turn capture refs.

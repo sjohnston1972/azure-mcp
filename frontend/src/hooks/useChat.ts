@@ -18,18 +18,22 @@ import { parseBicep } from "../lib/parse-bicep";
 let _idCounter = 0;
 const nextId = () => `m_${Date.now()}_${++_idCounter}`;
 
+/** Outcome of a turn for status-flip decisions:
+ *   - "success"    → flip to live / destroyed
+ *   - "failed"     → flip to failed
+ *   - "incomplete" → leave status unchanged (e.g. stream died mid-tool;
+ *                    Azure may still be processing — user should check)
+ *   - "noop"       → not a stage that flips status (build, view, free)
+ */
+export type TurnOutcome = "success" | "failed" | "incomplete" | "noop";
+
 type Callbacks = {
   onTopology?: (t: Topology) => void;
   onBicep?: (b: string) => void;
-  /** Fires when an assistant turn fully completes. `errored` is true
-   *  if any tool call this turn returned is_error — used to decide
-   *  whether a push succeeded (status=live) or failed (status=failed).
-   *  `userPrompt` is the text the user sent on the turn that triggered
-   *  this assistant response — used to auto-name newly-created
-   *  topologies on first build. */
+  /** Fires when an assistant turn fully completes. */
   onTurnComplete?: (info: {
     stage: Stage;
-    errored: boolean;
+    outcome: TurnOutcome;
     userPrompt: string;
   }) => void;
 };
@@ -136,16 +140,16 @@ export function useChat(cb: Callbacks = {}) {
       let assistantText = "";
       let topologyEmitted: Topology | null = null;
       let bicepEmitted: string | null = null;
-      // Track every tool result this turn AND the tool name. Final
-      // success state depends on the LAST tool call's outcome — Claude
-      // often retries a failed deploy_bicep / destroy_azure, and a
-      // self-recovered turn is overall successful. Stream-level errors
-      // (Anthropic SSE hiccups, network drops) do NOT count as tool
-      // failures — if deploy_bicep returned success and the stream
-      // dies after that, Azure is still live and we mark the topology
-      // accordingly.
-      const toolResults: { id: string; name: string; isError: boolean }[] = [];
-      let streamErrored = false;
+      // Track each tool call this turn. `outcome` is unresolved until
+      // the matching tool_result event arrives — if the SSE stream
+      // dies before that, the entry stays unresolved and the topology
+      // status is NOT flipped (the deployment may still be running on
+      // the backend; the user should check Azure rather than have us
+      // guess). Once resolved we know success or failure.
+      type ToolOutcome =
+        | { resolved: false }
+        | { resolved: true; isError: boolean };
+      const toolResults: { id: string; name: string; outcome: ToolOutcome }[] = [];
 
       const updateAssistant = (
         mut: (blocks: AssistantBlock[]) => AssistantBlock[]
@@ -202,10 +206,9 @@ export function useChat(cb: Callbacks = {}) {
               name: string;
               input: unknown;
             };
-            // Pre-record at tool_use time so we have the name even if
-            // the tool_result event never lands (e.g. stream cuts off).
-            // Defaulted to errored=true; flipped on tool_result.
-            toolResults.push({ id, name, isError: true });
+            // Pre-record at tool_use time. Outcome stays unresolved
+            // until the matching tool_result event arrives.
+            toolResults.push({ id, name, outcome: { resolved: false } });
             updateAssistant((blocks) => [
               ...blocks,
               {
@@ -223,7 +226,9 @@ export function useChat(cb: Callbacks = {}) {
               is_error: boolean;
             };
             const entry = toolResults.find((t) => t.id === id);
-            if (entry) entry.isError = Boolean(is_error);
+            if (entry) {
+              entry.outcome = { resolved: true, isError: Boolean(is_error) };
+            }
             updateAssistant((blocks) =>
               blocks.map((b) =>
                 b.type === "tool" && b.id === id
@@ -233,16 +238,38 @@ export function useChat(cb: Callbacks = {}) {
             );
           } else if (evt.event === "error") {
             const { message } = JSON.parse(evt.data) as { message: string };
-            streamErrored = true;
-            // Suppress alarming red error pill if a deploy/destroy
-            // already succeeded this turn — Azure is live, the stream
-            // hiccup after that is noise.
-            const succeededAt = toolResults.some(
-              (t) =>
-                !t.isError &&
-                (t.name === "deploy_bicep" || t.name === "destroy_azure")
-            );
-            if (!succeededAt) setError(message);
+            // What was the last interesting tool's state at the moment
+            // the stream died? Three cases:
+            //   - resolved-success: pure post-success noise → suppress
+            //   - resolved-failure: alarming red pill is fine
+            //   - unresolved (e.g. tool_use sent but tool_result never
+            //     came back): replace the cryptic "Error in input
+            //     stream" with a clearer warning so the user knows the
+            //     deployment may still be running on Azure's side
+            const lastInteresting = [...toolResults]
+              .reverse()
+              .find(
+                (t) => t.name === "deploy_bicep" || t.name === "destroy_azure"
+              );
+            if (
+              lastInteresting?.outcome.resolved === true &&
+              !lastInteresting.outcome.isError
+            ) {
+              // Suppress — Azure is live, stream hiccup is noise.
+            } else if (
+              lastInteresting &&
+              !lastInteresting.outcome.resolved
+            ) {
+              setError(
+                `Stream cut off while ${lastInteresting.name} was running ` +
+                  `(${message}). Azure may still be processing the ` +
+                  `${lastInteresting.name === "deploy_bicep" ? "deployment" : "deletion"}` +
+                  ` — check the Azure portal before retrying. ` +
+                  `Topology status left unchanged.`
+              );
+            } else {
+              setError(message);
+            }
           } else if (evt.event === "done") {
             setDisplay((d) =>
               d.map((m) =>
@@ -251,35 +278,40 @@ export function useChat(cb: Callbacks = {}) {
                   : m
               )
             );
-            // Errored decision (used to flip topology status):
-            //   1. For push: did the LAST deploy_bicep call succeed?
-            //      Yes  → not errored (live).
-            //      No   → errored (failed).
-            //      None → not errored, but persistBuildAfterTurn skips
-            //             the status flip since the deploy never started.
-            //   2. For teardown: same logic for destroy_azure.
-            //   3. For build/free: errored = stream-level error AND no
-            //      relevant tool succeeded (rare — only matters if a
-            //      build turn died completely).
+            // Outcome decision (used to flip topology status). Three
+            // cases per stage:
+            //   - LAST relevant tool call resolved with success  → "success"
+            //   - LAST relevant tool call resolved with failure  → "failed"
+            //   - LAST relevant tool call still unresolved (stream died
+            //     before tool_result arrived)                   → "incomplete"
+            //   - No relevant tool call happened at all          → "incomplete"
             //
-            // Stream-level errors AFTER a successful deploy/destroy do
-            // NOT count as a turn failure — the resources are live, the
+            // Stream-level errors AFTER a fully resolved success do
+            // NOT count as a failure — the resources are live, the
             // stream cutting off is just noise.
-            const lastDeploy = [...toolResults].reverse().find((t) => t.name === "deploy_bicep");
-            const lastDestroy = [...toolResults].reverse().find((t) => t.name === "destroy_azure");
-            let errored = false;
-            if (stage === "push") {
-              errored = lastDeploy ? lastDeploy.isError : false;
-            } else if (stage === "teardown") {
-              errored = lastDestroy ? lastDestroy.isError : false;
-            } else {
-              // build / view / free — only mark errored if the stream
-              // died AND nothing useful happened.
-              errored = streamErrored && toolResults.every((t) => t.isError);
-            }
+            const lastDeploy = [...toolResults]
+              .reverse()
+              .find((t) => t.name === "deploy_bicep");
+            const lastDestroy = [...toolResults]
+              .reverse()
+              .find((t) => t.name === "destroy_azure");
+
+            const outcomeFor = (
+              tool: typeof lastDeploy
+            ): TurnOutcome => {
+              if (!tool) return "incomplete";
+              if (!tool.outcome.resolved) return "incomplete";
+              return tool.outcome.isError ? "failed" : "success";
+            };
+
+            let outcome: TurnOutcome;
+            if (stage === "push") outcome = outcomeFor(lastDeploy);
+            else if (stage === "teardown") outcome = outcomeFor(lastDestroy);
+            else outcome = "noop";
+
             cbRef.current.onTurnComplete?.({
               stage,
-              errored,
+              outcome,
               userPrompt: text,
             });
           }
