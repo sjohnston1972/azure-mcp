@@ -33,6 +33,22 @@ const WORKSPACE_VOLUME =
 
 export const CUSTOM_TOOLS: Anthropic.Tool[] = [
   {
+    name: "validate_bicep",
+    description:
+      "Compile-check a Bicep template via `az bicep build`. Use this in build/view stages BEFORE emitting a `<bicep>` marker so the user only sees a template that actually compiles. Catches: syntax errors, `newGuid()`/`utcNow()` used outside parameter defaults, missing module references, broken AVM module versions, undefined symbols, type mismatches. Does NOT contact Azure — fast, runs locally in the azure-cli sidecar. Returns the compile output verbatim. If the template doesn't validate, fix the errors and call this again before emitting the final marker.",
+    input_schema: {
+      type: "object",
+      properties: {
+        bicep: {
+          type: "string",
+          description:
+            "The full Bicep template source to validate. Self-contained — do NOT include `./relative` module references; the validator runs the file in isolation with no neighbour files mounted.",
+        },
+      },
+      required: ["bicep"],
+    },
+  },
+  {
     name: "destroy_azure",
     description:
       "Delete Azure resources. Use this for tear-down — the Azure MCP Server has no resource-group-delete or generic delete-by-tag tool. This tool spawns Microsoft's official azure-cli container with the project's service-principal credentials and runs `az group delete` and/or `az resource delete --ids` against matched resources. Two operating modes: (1) `resource_group_name` to delete a specific resource group (cascades to all resources inside); (2) `tag_filters` to delete every resource group AND every standalone resource that carries ALL the listed tags. The two modes can be combined. Returns the deletion summary verbatim.",
@@ -117,10 +133,68 @@ export async function callCustomTool(
   if (name === "destroy_azure") {
     return runDestroy(input as DestroyAzureInput);
   }
+  if (name === "validate_bicep") {
+    return runValidateBicep(input as { bicep?: string });
+  }
   return {
     content: `unknown custom tool: ${name}`,
     is_error: true,
   };
+}
+
+async function runValidateBicep(input: {
+  bicep?: string;
+}): Promise<{ content: string; is_error: boolean }> {
+  if (!input.bicep || typeof input.bicep !== "string") {
+    return { content: "`bicep` is required and must be a string", is_error: true };
+  }
+
+  const id = `validate-${randomUUID().slice(0, 8)}`;
+  const filename = `${id}.bicep`;
+  const hostPath = join(WORKSPACE, filename);
+  await writeFile(hostPath, input.bicep, "utf8");
+
+  try {
+    // No `az login` needed — `az bicep build` is purely local. We
+    // build to /dev/null because we only care about compile output,
+    // not the resulting ARM JSON.
+    const dockerArgs = [
+      "run",
+      "--rm",
+      "-v",
+      `${WORKSPACE_VOLUME}:/work`,
+      AZURE_CLI_IMAGE,
+      "sh",
+      "-c",
+      `az bicep build --file "/work/${filename}" --stdout > /dev/null`,
+    ];
+
+    const result = await spawnAndCapture("docker", dockerArgs, {
+      timeoutMs: 90_000,
+    });
+
+    const ok = result.code === 0;
+    const summary = ok
+      ? `# validate_bicep — OK\n\nTemplate compiles cleanly. Safe to emit the \`<bicep>\` marker.`
+      : [
+          `# validate_bicep — FAILED (exit ${result.code})`,
+          ``,
+          `## errors`,
+          "```",
+          (result.stderr.trim() || result.stdout.trim()).slice(-3000),
+          "```",
+          ``,
+          `Fix these issues, then call \`validate_bicep\` again before emitting the \`<bicep>\` marker.`,
+        ].join("\n");
+
+    return { content: summary, is_error: !ok };
+  } finally {
+    try {
+      await unlink(hostPath);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 type DestroyAzureInput = {

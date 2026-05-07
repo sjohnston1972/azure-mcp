@@ -64,6 +64,13 @@ Rules for \`<bicep>\`:
 - \`targetScope = 'subscription'\` if the build creates a resource group; otherwise omit (resource-group scope is the default).
 - Tag every resource (or the parent resource group, since tags inherit) with \`mcp-project = <project name>\` (and \`mcp-topology-id\` when an active topology is set). Use the \`mcp-\` prefix verbatim — not \`azure-mcp-\` (some Azure resource providers reject the \`azure-\` prefix on user tags).
 
+**Bicep template MUST be self-contained and compile.** Before emitting the final \`<bicep>\` marker, call \`validate_bicep\` with the template you're about to send. If validation fails, fix the errors and call it again. Only emit the marker once it compiles clean. Specific rules to avoid common compile errors:
+- **No external file references.** Do NOT use \`module x './hubspoke.bicep' = {...}\` or any \`./\` relative import — neighbouring .bicep files are not mounted at deploy time. Inline every module body into the single template, or reference public AVM modules via \`br/public:avm/...\` only.
+- **AVM modules must exist.** Only reference AVM modules whose versions you are certain exist on the public registry (e.g. \`br/public:avm/res/network/virtual-network:0.5.0\`). Do NOT invent paths like \`avm/ptn/network/hub-spoke:0.0.0\` — pattern modules at \`0.0.0\` rarely exist. When in doubt, write the resource declaration inline rather than reach for a non-existent module.
+- **\`newGuid()\` and \`utcNow()\` are restricted.** They can ONLY be used as parameter default values, not in \`var\` blocks or expressions. The right pattern is: \`param deploymentId string = newGuid()\` then reference \`deploymentId\` everywhere.
+- **Single self-contained file.** Even for multi-resource architectures (hub + 2 spokes + peerings + NSGs), keep it all in one .bicep template. Validation runs the file in isolation.
+- **\`location\` consistency.** Don't mix \`location = 'uksouth'\` literals with \`location = location\` — pick one source per resource and stick with it.
+
 In **push** stage:
 - **Use the \`deploy_bicep\` tool.** This is the canonical path for any infrastructure deployment. Microsoft's Azure MCP Server has no Bicep deployment tool — its \`bicepschema\` is read-only schema lookup, and its \`deploy\` family is for app-code deployments via azd, not raw Bicep templates. The host has provided a custom \`deploy_bicep\` tool that spawns Microsoft's official azure-cli with the project's service-principal creds and runs \`az deployment ... create\` for you. Pass the entire Bicep template as the \`bicep\` parameter.
 - For subscription-scoped templates (those that include \`targetScope = 'subscription'\` and create resource groups), set \`scope='subscription'\` and a \`location\`.
