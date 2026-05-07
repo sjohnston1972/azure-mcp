@@ -3,6 +3,8 @@
 
 import type {
   ChatMessage,
+  GithubPushResult,
+  GithubStatus,
   Project,
   Schedule,
   Stage,
@@ -62,6 +64,27 @@ export async function createProject(input: {
 export async function deleteProject(id: string): Promise<void> {
   const res = await fetch(`/api/projects/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`/api/projects/${id} → ${res.status}`);
+}
+
+// ── GitHub integration ──────────────────────────────────────────────
+
+export async function getGithubStatus(): Promise<GithubStatus> {
+  const res = await fetch("/api/github/status");
+  if (!res.ok) throw new Error(`/api/github/status → ${res.status}`);
+  return res.json();
+}
+
+export async function pushProjectToGithub(
+  projectId: string
+): Promise<GithubPushResult> {
+  const res = await fetch(`/api/projects/${projectId}/github/push`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`github push → ${res.status}: ${text || res.statusText}`);
+  }
+  return res.json();
 }
 
 // ── Templates ────────────────────────────────────────────────────────

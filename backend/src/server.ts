@@ -22,6 +22,7 @@ import { templateRoutes } from "./routes/templates.js";
 import { scheduleRoutes } from "./routes/schedules.js";
 import { topologyRoutes } from "./routes/topologies.js";
 import { closeMcpClient } from "./mcp/client.js";
+import { closeBicepMcpClient } from "./mcp/bicep-client.js";
 import { migrate } from "./db/migrate.js";
 import { reloadSchedules, shutdownScheduler } from "./scheduler/index.js";
 
@@ -58,6 +59,7 @@ const shutdown = async (signal: string) => {
   app.log.info({ signal }, "shutting down");
   shutdownScheduler();
   await closeMcpClient();
+  await closeBicepMcpClient();
   await app.close();
   process.exit(0);
 };

@@ -70,6 +70,22 @@ services:
       retries: 5
       start_period: 20s
 
+  # ── Microsoft's Bicep MCP server (Azure.Bicep.McpServer) ───────────
+  # Authoring helpers: bicep diagnostics, AVM module metadata, schema
+  # lookup, format, decompile. Does NOT deploy. Spawned on demand via
+  # docker-in-docker by the backend. The `profiles` directive keeps
+  # this from running as a long-lived service (we only want the image
+  # built so the backend can spin it up per chat connection).
+  bicep-mcp:
+    build:
+      context: ./bicep-mcp
+      dockerfile: Dockerfile
+    image: azure-mcp-bicep-mcp:latest
+    profiles: ["_build_only_"]
+    # No-op command — this service exists to get the image built by
+    # `docker compose build`. Backend never starts this directly.
+    command: ["true"]
+
   # ── Postgres (projects, deployments, templates) ────────────────────
   azure-mcp-db:
     container_name: azure-mcp-db

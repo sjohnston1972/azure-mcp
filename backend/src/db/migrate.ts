@@ -75,6 +75,14 @@ export async function migrate(): Promise<void> {
     END
     $$;
   `);
+
+  // GitHub-sync columns on projects. github_repo is "owner/name" once
+  // set; null means the project hasn't been synced yet. github_synced_at
+  // is the wall-clock of the last successful sync.
+  await pool.query(`
+    ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_repo TEXT;
+    ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_synced_at TIMESTAMPTZ;
+  `);
   // eslint-disable-next-line no-console
   console.log("[db] migrations applied");
 }

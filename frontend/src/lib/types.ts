@@ -62,8 +62,25 @@ export type Project = {
   id: string;
   name: string;
   description: string | null;
+  github_repo: string | null;
+  github_synced_at: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type GithubStatus = {
+  configured: boolean;
+  owner: string | null;
+  visibility: "public" | "private";
+};
+
+export type GithubPushResult = {
+  ok: boolean;
+  repo: string;
+  repo_url: string;
+  repo_was_created: boolean;
+  topologies_synced: number;
+  project: Project;
 };
 
 // Lifecycle stages for a chat turn. Sent to /api/chat as `stage`.

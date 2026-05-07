@@ -142,6 +142,16 @@ POSTGRES_PASSWORD=change-me
 TRUSTED_USER_EMAIL=you@example.com
 ```
 
+### Optional: GitHub sync
+
+Set `GH_TOKEN` (a personal access token with `repo` scope) and `GH_OWNER` (your GitHub username) in `.env` to enable per-project sync to GitHub. The dropdown gains a **Sync** button per project that:
+
+- creates `${GH_OWNER}/azure-mcp-<project-name>` if it doesn't exist (private by default; flip with `GH_REPO_VISIBILITY=public`),
+- writes a generated `README.md` listing every topology and its status,
+- writes one `topologies/<topology-name>.bicep` per topology with bicep content.
+
+The dropdown row shows "GitHub · synced X ago" for synced projects. Leave the env vars unset and the GitHub UI hides itself.
+
 ### 2. Bring it up
 
 The repo expects an existing external Docker network called `net_core` (the homelab convention). Create one if you don't have it:

@@ -23,6 +23,9 @@ function readEnv(): Record<RequiredEnv, string> & {
   AZURE_MCP_URL: string;
   PORT_BACKEND: number;
   PUBLIC_URL: string;
+  GH_TOKEN: string;
+  GH_OWNER: string;
+  GH_REPO_VISIBILITY: "public" | "private";
 } {
   const missing = REQUIRED.filter((k) => !process.env[k] || process.env[k] === "");
   if (missing.length > 0) {
@@ -43,6 +46,15 @@ function readEnv(): Record<RequiredEnv, string> & {
     AZURE_MCP_URL: process.env.AZURE_MCP_URL ?? "http://azure-mcp:5008/sse",
     PORT_BACKEND: Number(process.env.PORT_BACKEND ?? "3000"),
     PUBLIC_URL: process.env.PUBLIC_URL ?? "http://localhost:8080",
+    // GitHub integration is optional. If GH_TOKEN is unset, the sync
+    // endpoints respond with a clear "not configured" error and the
+    // frontend hides the sync button.
+    GH_TOKEN: process.env.GH_TOKEN ?? "",
+    GH_OWNER: process.env.GH_OWNER ?? "",
+    GH_REPO_VISIBILITY:
+      (process.env.GH_REPO_VISIBILITY ?? "private") === "public"
+        ? "public"
+        : "private",
   };
 }
 

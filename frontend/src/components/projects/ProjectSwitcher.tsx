@@ -1,29 +1,65 @@
 // Header dropdown for selecting / creating projects.
 
 import { useEffect, useRef, useState } from "react";
-import type { Project } from "../../lib/types";
+import type { GithubStatus, Project } from "../../lib/types";
+import { pushProjectToGithub } from "../../lib/api";
 import { useConfirm } from "../ui/useConfirm";
 
 type Props = {
   projects: Project[];
   current: Project | null;
   loading: boolean;
+  githubStatus: GithubStatus | null;
   onSelect: (p: Project) => void;
   onCreate: () => void;
   onDelete: (p: Project) => void;
+  /** Called when a successful push updates a project's github_repo /
+   *  github_synced_at — App refreshes its project list. */
+  onProjectUpdated: (p: Project) => void;
 };
 
 export function ProjectSwitcher({
   projects,
   current,
   loading,
+  githubStatus,
   onSelect,
   onCreate,
   onDelete,
+  onProjectUpdated,
 }: Props) {
   const [open, setOpen] = useState(false);
+  const [syncingId, setSyncingId] = useState<string | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const confirm = useConfirm();
+
+  const ghEnabled = !!githubStatus?.configured;
+
+  const handleSync = async (p: Project) => {
+    setSyncError(null);
+    setSyncingId(p.id);
+    try {
+      const result = await pushProjectToGithub(p.id);
+      onProjectUpdated(result.project);
+    } catch (e) {
+      setSyncError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSyncingId(null);
+    }
+  };
+
+  const fmtAgo = (iso: string | null): string => {
+    if (!iso) return "never";
+    const ms = Date.now() - new Date(iso).getTime();
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -110,7 +146,44 @@ export function ProjectSwitcher({
                               {p.description}
                             </div>
                           )}
+                          {ghEnabled && (
+                            <div className="ml-[22px] mt-0.5 flex items-center gap-1.5 text-[10px]">
+                              <span className="material-symbols-outlined text-[12px] text-on-surface-variant">
+                                hub
+                              </span>
+                              {p.github_synced_at ? (
+                                <span className="text-secondary font-semibold">
+                                  GitHub · synced {fmtAgo(p.github_synced_at)}
+                                </span>
+                              ) : (
+                                <span className="text-on-surface-variant">
+                                  GitHub · never synced
+                                </span>
+                              )}
+                            </div>
+                          )}
                         </button>
+                        {ghEnabled && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void handleSync(p);
+                            }}
+                            disabled={syncingId === p.id}
+                            title={
+                              p.github_repo
+                                ? `Re-sync to ${p.github_repo}`
+                                : `Sync to GitHub (will create ${githubStatus?.owner}/azure-mcp-${p.name})`
+                            }
+                            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-bold text-primary border border-primary/30 bg-primary/5 hover:bg-primary/15 transition-colors disabled:opacity-50"
+                          >
+                            <span className="material-symbols-outlined text-[14px]">
+                              {syncingId === p.id ? "sync" : "cloud_upload"}
+                            </span>
+                            {syncingId === p.id ? "Syncing…" : "Sync"}
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={async () => {
@@ -151,6 +224,17 @@ export function ProjectSwitcher({
               </ul>
             )}
           </div>
+          {syncError && (
+            <div className="px-3 py-2 bg-error/5 border-t border-error/30 text-[11px] text-error font-mono break-words">
+              GitHub sync failed: {syncError}
+            </div>
+          )}
+          {!ghEnabled && (
+            <div className="px-3 py-1.5 border-t border-outline-variant/30 text-[10px] text-on-surface-variant">
+              GitHub sync disabled — set <code className="font-mono">GH_TOKEN</code> +{" "}
+              <code className="font-mono">GH_OWNER</code> in <code className="font-mono">.env</code>.
+            </div>
+          )}
           <div className="border-t border-outline-variant/30 p-2">
             <button
               type="button"

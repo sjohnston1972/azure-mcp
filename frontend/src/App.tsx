@@ -26,12 +26,14 @@ import {
   createTopology,
   deleteProject,
   deleteTopology,
+  getGithubStatus,
   listProjects,
   listTopologies,
   patchTopology,
 } from "./lib/api";
 import type {
   BuildState,
+  GithubStatus,
   Project,
   TopologyRecord,
 } from "./lib/types";
@@ -80,6 +82,7 @@ function AppInner() {
   const [pendingDestroy, setPendingDestroy] = useState<
     { topologyId: string; key: number } | null
   >(null);
+  const [githubStatus, setGithubStatus] = useState<GithubStatus | null>(null);
 
   // ── Project bootstrap + selection ────────────────────────────
   const refresh = useCallback(async () => {
@@ -99,6 +102,15 @@ function AppInner() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // GitHub status is global config (whether GH_TOKEN + GH_OWNER are
+  // present in the env), fetched once at boot. Drives whether the
+  // sync UI shows up at all.
+  useEffect(() => {
+    getGithubStatus()
+      .then(setGithubStatus)
+      .catch(() => setGithubStatus({ configured: false, owner: null, visibility: "private" }));
+  }, []);
 
   // When the project changes, load its topologies and pick the active one.
   useEffect(() => {
@@ -387,9 +399,16 @@ function AppInner() {
             projects={projects}
             current={current}
             loading={loading}
+            githubStatus={githubStatus}
             onSelect={select}
             onCreate={() => setModalOpen(true)}
             onDelete={(p) => void removeProject(p)}
+            onProjectUpdated={(updated) => {
+              setProjects((cur) =>
+                cur.map((p) => (p.id === updated.id ? updated : p))
+              );
+              if (current?.id === updated.id) setCurrent(updated);
+            }}
           />
         </div>
       </header>

@@ -50,10 +50,13 @@ async function connect(): Promise<Client> {
       "-e", "AZURE_MCP_COLLECT_TELEMETRY=false",
       IMAGE,
       "--transport=stdio",
-      // Probe mode=all to expose individual tools rather than namespace
-      // routers. CLAUDE.md path needs raw operations for IaC-style
-      // deployment (network create, vnet peering, etc).
-      "--mode=all",
+      // mode=namespace (the default) is much cheaper on tokens — ~63
+      // namespace-level tools instead of ~319 individual operations.
+      // For our flow (inspect via subscription_list/group_list/etc;
+      // deploy via our custom deploy_bicep; destroy via destroy_azure)
+      // the granular operations aren't needed and bloat every request
+      // by ~130k cached tokens. See DECISIONS.md "Token cost".
+      // Removed: --mode=all
     ],
     // The MCP server logs to stderr; surface it in the backend log so
     // we can see why something blew up without docker logs gymnastics.
