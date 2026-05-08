@@ -58,6 +58,15 @@ services:
       # spawned azure-cli container mounts the same volume to read
       # them for `az deployment ... create -f /work/<id>.bicep`.
       - azure-mcp-deploy-workspace:/work
+      # Optional: mount the host's `gh` CLI config so the backend can
+      # reuse the existing oauth token (no PAT setup required). Set
+      # GH_CONFIG_DIR in .env to point at your gh config dir:
+      #   Linux/Mac:  $HOME/.config/gh
+      #   Windows:    C:/Users/<you>/AppData/Roaming/GitHub CLI
+      # Defaults to an empty dir in the repo, so the mount succeeds
+      # even if the user hasn't configured this — backend then falls
+      # back to the GH_TOKEN env var (also optional).
+      - "${GH_CONFIG_DIR:-./gh-config}:/gh-config:ro"
     depends_on:
       azure-mcp-db:
         condition: service_healthy

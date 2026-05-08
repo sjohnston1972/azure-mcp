@@ -1,0 +1,4 @@
+# Default empty mount target for the optional gh-CLI config bind mount
+# (see docker-compose.yml). When GH_CONFIG_DIR is set in .env, that
+# override path mounts here instead — the backend reads the active gh
+# token + user from hosts.yml inside.
