@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { config } from "../config.js";
 import { CURATED_VM_SKUS } from "../lib/vm-skus.js";
+import { CURATED_EC2_TYPES } from "../lib/ec2-types.js";
 
 const AZURE_CLI_IMAGE =
   process.env.AZURE_CLI_IMAGE ?? "mcr.microsoft.com/azure-cli:latest";
@@ -294,6 +295,29 @@ export const CUSTOM_TOOLS: Anthropic.Tool[] = [
       },
     },
   },
+  {
+    name: "list_ec2_types",
+    description:
+      "Return the curated list of AWS EC2 instance types the host knows about, with vCPU/RAM/network specs, indicative monthly USD price, and a `free_tier` flag. Use this BEFORE proposing an EC2 instance type so you can: (1) default to `t3.micro` when the user hasn't specified — that's the only type eligible for AWS's 12-month free tier (750 hrs/mo on new accounts), and (2) match larger types to the user's stated workload. Pricing is approximate (on-demand, Linux, us-east-1) — flag that to the user, don't quote it as final. Optional filters: `family` (one of: burstable, general-purpose, memory-optimized, compute-optimized, gpu, storage-optimized, graviton-arm), `free_tier_only` (true returns only the t3.micro entry).",
+    input_schema: {
+      type: "object",
+      properties: {
+        family: {
+          type: "string",
+          enum: [
+            "burstable",
+            "general-purpose",
+            "memory-optimized",
+            "compute-optimized",
+            "gpu",
+            "storage-optimized",
+            "graviton-arm",
+          ],
+        },
+        free_tier_only: { type: "boolean" },
+      },
+    },
+  },
 ];
 
 const CUSTOM_TOOL_NAMES = new Set(CUSTOM_TOOLS.map((t) => t.name));
@@ -332,9 +356,40 @@ export async function callCustomTool(
   if (name === "destroy_aws") {
     return runDestroyAws(input as DestroyAwsInput);
   }
+  if (name === "list_ec2_types") {
+    return runListEc2Types(
+      input as { family?: string; free_tier_only?: boolean }
+    );
+  }
   return {
     content: `unknown custom tool: ${name}`,
     is_error: true,
+  };
+}
+
+async function runListEc2Types(input: {
+  family?: string;
+  free_tier_only?: boolean;
+}): Promise<{ content: string; is_error: boolean }> {
+  let types = CURATED_EC2_TYPES;
+  if (input.family) {
+    types = types.filter((t) => t.family === input.family);
+  }
+  if (input.free_tier_only) {
+    types = types.filter((t) => t.free_tier);
+  }
+  return {
+    content: JSON.stringify(
+      {
+        count: types.length,
+        free_tier_note:
+          "AWS's 12-month free tier covers 750 hrs/mo of t3.micro Linux on NEW accounts (or t2.micro in regions where t3 isn't available). Free-tier hours are account-wide, not per-instance.",
+        types,
+      },
+      null,
+      2
+    ),
+    is_error: false,
   };
 }
 

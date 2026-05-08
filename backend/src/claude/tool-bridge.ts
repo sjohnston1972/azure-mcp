@@ -60,7 +60,8 @@ function splitCustomToolsByCloud(): {
     } else if (
       t.name === "deploy_cloudformation" ||
       t.name === "destroy_aws" ||
-      t.name === "validate_cloudformation"
+      t.name === "validate_cloudformation" ||
+      t.name === "list_ec2_types"
     ) {
       aws.push(t);
     } else {

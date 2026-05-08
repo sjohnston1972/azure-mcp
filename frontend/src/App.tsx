@@ -21,6 +21,7 @@ import { ProjectSwitcher } from "./components/projects/ProjectSwitcher";
 import { NewProjectModal } from "./components/projects/NewProjectModal";
 import { SchedulerModal } from "./components/scheduler/SchedulerModal";
 import { VmSelector } from "./components/azure/VmSelector";
+import { Ec2Selector } from "./components/aws/Ec2Selector";
 import { ConfirmProvider, useConfirm } from "./components/ui/useConfirm";
 import {
   createProject,
@@ -90,6 +91,7 @@ function AppInner() {
   >(null);
   const [githubStatus, setGithubStatus] = useState<GithubStatus | null>(null);
   const [vmSelectorOpen, setVmSelectorOpen] = useState(false);
+  const [ec2SelectorOpen, setEc2SelectorOpen] = useState(false);
 
   // Active cloud — drives which projects show up in the dropdown,
   // which system prompt the chat uses, which deploy tools are
@@ -718,6 +720,17 @@ function AppInner() {
               VM sizes
             </button>
           )}
+          {cloud === "aws" && (
+            <button
+              type="button"
+              onClick={() => setEc2SelectorOpen(true)}
+              title="Browse AWS EC2 instance types (free-tier highlighted)"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-outline-variant/40 hover:bg-surface-container-high transition-colors text-sm font-semibold text-on-surface-variant"
+            >
+              <span className="material-symbols-outlined text-base">memory</span>
+              EC2 sizes
+            </button>
+          )}
           <ProjectSwitcher
             projects={projects}
             current={current}
@@ -836,6 +849,20 @@ function AppInner() {
           // example prompts on the empty canvas use.
           setAutoPrompt({
             text: `Design a single Linux VM using SKU ${sku}. Default region uksouth, smallest reasonable disk, system-assigned managed identity, no public IP. Tag everything per the project's mcp-* scheme.`,
+            key: Date.now(),
+          });
+        }}
+      />
+
+      <Ec2Selector
+        open={ec2SelectorOpen}
+        onClose={() => setEc2SelectorOpen(false)}
+        onPick={(typeName) => {
+          // Same pattern as VM picker — drop a build-stage prompt
+          // pinning the chosen EC2 type so Claude generates a CFN
+          // template using exactly that size.
+          setAutoPrompt({
+            text: `Design a single Linux EC2 instance using type ${typeName}. Default region us-east-1, smallest reasonable EBS volume, no public IP (private subnet + NAT), use the dynamic SSM parameter for the AMI. Tag everything per the project's mcp-* scheme.`,
             key: Date.now(),
           });
         }}

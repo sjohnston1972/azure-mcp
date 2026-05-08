@@ -22,6 +22,7 @@ import { templateRoutes } from "./routes/templates.js";
 import { scheduleRoutes } from "./routes/schedules.js";
 import { topologyRoutes } from "./routes/topologies.js";
 import { azureRoutes } from "./routes/azure.js";
+import { awsRoutes } from "./routes/aws.js";
 import { closeMcpClient } from "./mcp/client.js";
 import { closeBicepMcpClient } from "./mcp/bicep-client.js";
 import { migrate } from "./db/migrate.js";
@@ -53,6 +54,7 @@ await app.register(templateRoutes);
 await app.register(scheduleRoutes);
 await app.register(topologyRoutes);
 await app.register(azureRoutes);
+await app.register(awsRoutes);
 
 // Idempotent migrations + scheduler bootstrap. Migrations run BEFORE
 // the cron loader so the schedules table is guaranteed to exist when
