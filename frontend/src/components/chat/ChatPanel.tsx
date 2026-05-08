@@ -3,7 +3,7 @@
 // to the parent (App), which holds per-project build state.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useChat, type TurnOutcome } from "../../hooks/useChat";
+import { useChat, type ToolStatus } from "../../hooks/useChat";
 import { parseAnswers } from "../../lib/parse-answers";
 import type { BuildState } from "../../lib/types";
 import type { Topology } from "../../lib/parse-topology";
@@ -13,6 +13,7 @@ import { Message } from "./Message";
 import { StageBar } from "./StageBar";
 import { BicepDrawer } from "./BicepDrawer";
 import { useConfirm } from "../ui/useConfirm";
+import { downloadChatMarkdown } from "../../lib/export-chat";
 
 type Props = {
   projectName: string | null;
@@ -39,16 +40,17 @@ type Props = {
   onSchedule: () => void;
   onAutoPromptConsumed: () => void;
   onPendingDestroyConsumed: () => void;
+  /** Fires after a Bicep template is saved from the drawer, so the
+   *  rail's Templates tab can refetch without the user flipping tabs. */
+  onTemplateSaved?: () => void;
   /** Fires after every assistant turn ends. App uses this to persist
    *  the topology + bicep to the backend (creating or PATCHing the
    *  active record), and to flip topology status on push/teardown.
    *
-   *  `outcome` is the per-stage result:
-   *    - "success"    → push/teardown's relevant tool resolved OK
-   *    - "failed"     → resolved with is_error
-   *    - "incomplete" → stream died before tool_result, or the relevant
-   *                     tool was never called (don't flip status)
-   *    - "noop"       → stage doesn't flip status (build/view/free)
+   *  `deploy` and `destroy` report the LAST invocation of each tool in
+   *  this turn (or `null` if it wasn't called). Computing status from
+   *  these — rather than from the stage label — is what lets a build-
+   *  stage retry of a failed push correctly flip the topology to live.
    *
    *  `userPrompt` is the text that triggered this turn — used to
    *  auto-name a new topology on first build. */
@@ -57,7 +59,8 @@ type Props = {
     topology: Topology | null,
     bicep: string | null,
     teardownTargetId: string | null,
-    outcome: TurnOutcome,
+    deploy: ToolStatus,
+    destroy: ToolStatus,
     userPrompt: string
   ) => void;
 };
@@ -78,6 +81,7 @@ export function ChatPanel({
   onSchedule,
   onAutoPromptConsumed,
   onPendingDestroyConsumed,
+  onTemplateSaved,
   onTurnComplete,
 }: Props) {
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -100,17 +104,23 @@ export function ChatPanel({
       turnBicepRef.current = b;
       onBicepChange(b);
     },
-    onTurnComplete: ({ stage, outcome, userPrompt }) => {
-      // Only flip the local "pushed" / "torndown" flags on a fully
-      // resolved success — leave them alone on failed or incomplete.
-      if (stage === "push" && outcome === "success") onPushed();
-      if (stage === "teardown" && outcome === "success") onTorndown();
+    onTurnComplete: ({ stage, deploy, destroy, userPrompt }) => {
+      // Local "pushed" / "torndown" flags reflect the user's intent —
+      // they only flip when the user actually clicked the Push or
+      // Tear-down button (i.e. the Stage was push/teardown) AND the
+      // corresponding tool succeeded. A build-stage retry that happens
+      // to call deploy_bicep will still flip the persisted topology
+      // status (handled in App.tsx via deploy/destroy), but doesn't
+      // light up the local "deployed" badge until the user clicks Push.
+      if (stage === "push" && deploy === "success") onPushed();
+      if (stage === "teardown" && destroy === "success") onTorndown();
       onTurnComplete(
         stage,
         turnTopologyRef.current,
         turnBicepRef.current,
         turnTeardownTargetRef.current,
-        outcome,
+        deploy,
+        destroy,
         userPrompt
       );
       // Reset per-turn capture refs.
@@ -272,13 +282,32 @@ export function ChatPanel({
               </p>
             </div>
             {display.length > 0 && (
-              <button
-                type="button"
-                onClick={reset}
-                className="text-xs font-semibold text-on-surface-variant hover:text-on-surface px-2 py-1 rounded-md hover:bg-surface-container-high transition-colors"
-              >
-                New chat
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() =>
+                    downloadChatMarkdown({
+                      display,
+                      projectName,
+                      topologyName: activeTopologyName,
+                    })
+                  }
+                  title="Download chat as Markdown (.md)"
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-on-surface-variant hover:text-on-surface px-2 py-1 rounded-md hover:bg-surface-container-high transition-colors"
+                >
+                  <span className="material-symbols-outlined text-base">
+                    download
+                  </span>
+                  Export
+                </button>
+                <button
+                  type="button"
+                  onClick={reset}
+                  className="text-xs font-semibold text-on-surface-variant hover:text-on-surface px-2 py-1 rounded-md hover:bg-surface-container-high transition-colors"
+                >
+                  New chat
+                </button>
+              </div>
             )}
           </div>
           <StageBar
@@ -341,8 +370,10 @@ export function ChatPanel({
         bicep={build?.bicep ?? null}
         onClose={() => setDrawerOpen(false)}
         onSaved={() => {
-          // Give a small UX hint by closing the drawer.
+          // Give a small UX hint by closing the drawer, and let the
+          // parent know so the rail's Templates tab refetches.
           setDrawerOpen(false);
+          onTemplateSaved?.();
         }}
       />
     </>

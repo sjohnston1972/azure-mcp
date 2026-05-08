@@ -26,6 +26,7 @@ import {
   createProject,
   createTopology,
   deleteProject,
+  deleteTemplate,
   deleteTopology,
   getGithubStatus,
   listProjects,
@@ -36,11 +37,12 @@ import type {
   BuildState,
   GithubStatus,
   Project,
+  Template,
   TopologyRecord,
 } from "./lib/types";
 import type { Topology } from "./lib/parse-topology";
 import { inferTopologyName } from "./lib/infer-name";
-import type { TurnOutcome } from "./hooks/useChat";
+import type { ToolStatus } from "./hooks/useChat";
 
 const ACTIVE_PROJECT_KEY = "azure-mcp:active-project-id";
 const activeTopologyKey = (projectId: string) =>
@@ -217,6 +219,87 @@ function AppInner() {
     []
   );
 
+  // Bumped after a template is loaded or deleted so the rail's
+  // Templates tab refetches without the user having to flip tabs.
+  const [templatesRefreshKey, setTemplatesRefreshKey] = useState(0);
+
+  /** Load a saved Bicep template into the active project as a new
+   *  draft topology. The template only stores Bicep — we set it on the
+   *  new topology and auto-prompt Claude to render the canvas
+   *  topology marker from it, so the visual fills in on the next turn. */
+  const handleLoadTemplate = useCallback(
+    async (t: Template) => {
+      if (!current) return;
+      const ok = await confirm({
+        title: `Load '${t.name}' into '${current.name}'?`,
+        message: (
+          <>
+            Creates a new <strong>draft topology</strong> in this project
+            from the saved Bicep. Claude will render the canvas on the
+            next turn — nothing deploys until you click Push.
+          </>
+        ),
+        confirmLabel: "Load template",
+        icon: "bookmark",
+        tone: "primary",
+      });
+      if (!ok) return;
+      try {
+        const created = await createTopology({
+          project_id: current.id,
+          name: t.name.slice(0, 24),
+          bicep: t.bicep,
+        });
+        setTopologies((cur) => [created, ...cur]);
+        setActiveTopologyId(created.id);
+        // Ask Claude to populate the topology marker from the loaded
+        // Bicep so the canvas fills in. The Bicep is inlined so the
+        // model has it even if Claude's earlier conversation history
+        // doesn't contain it (e.g. brand-new chat).
+        setAutoPrompt({
+          text:
+            `I've loaded the saved template '${t.name}' as a new draft topology in '${current.name}'. ` +
+            `Render the topology canvas based on this Bicep — emit a \`<topology>\` marker only (no \`<bicep>\`, no changes). ` +
+            `Don't deploy. Here's the template:\n\n` +
+            "```bicep\n" +
+            t.bicep +
+            "\n```",
+          key: Date.now(),
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("[load template]", err);
+      }
+    },
+    [current, confirm]
+  );
+
+  const handleDeleteTemplate = useCallback(
+    async (t: Template) => {
+      const ok = await confirm({
+        title: `Delete template '${t.name}'?`,
+        message: (
+          <>
+            This removes the saved Bicep snippet. Topologies that were
+            created from it stay intact.
+          </>
+        ),
+        confirmLabel: "Delete",
+        tone: "danger",
+        icon: "delete",
+      });
+      if (!ok) return;
+      try {
+        await deleteTemplate(t.id);
+        setTemplatesRefreshKey((k) => k + 1);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("[delete template]", err);
+      }
+    },
+    [confirm]
+  );
+
   const handleDeleteTopology = useCallback(
     async (t: TopologyRecord) => {
       const live = t.status === "live";
@@ -258,17 +341,18 @@ function AppInner() {
       topologyAtTurn: Topology | null,
       bicepAtTurn: string | null,
       teardownTargetId: string | null,
-      outcome: TurnOutcome,
+      deploy: ToolStatus,
+      destroy: ToolStatus,
       userPrompt: string
     ) => {
       if (!current) return;
       try {
-        if (stage === "teardown" && teardownTargetId) {
-          // Per-topology destroy → only mark destroyed on a fully
-          // resolved success. On failure, leave status alone (user
-          // can retry). On 'incomplete' (stream died mid-tool), also
-          // leave status alone — Azure may still be processing.
-          if (outcome !== "success") return;
+        // Per-topology destroy (rail-initiated) → only flip when a
+        // teardown target was queued AND destroy_azure resolved with
+        // success. We deliberately key off destroy/teardownTargetId
+        // instead of stage so a destroy that happens via a typed-in
+        // build-stage message (rare but possible) still gets honoured.
+        if (teardownTargetId && destroy === "success") {
           const updated = await patchTopology(teardownTargetId, {
             status: "destroyed",
             topology: { nodes: [], edges: [] },
@@ -278,28 +362,35 @@ function AppInner() {
           );
           return;
         }
+        // destroy "failed" / "incomplete" / null → leave status alone.
 
-        if (stage === "push" && activeTopologyId) {
-          // Push outcome:
-          //   - success    → flip to live, persist topology+bicep
-          //   - failed     → flip to failed, persist topology+bicep
-          //   - incomplete → DON'T flip status (stream died mid-call,
-          //                  Azure may still be deploying — user
-          //                  should check the portal). Do still
-          //                  persist the topology+bicep.
+        // Deploy outcome (regardless of stage label). The user can
+        // retry a failed push by typing a follow-up message — that
+        // goes out as stage='build' but Claude will call deploy_bicep
+        // again. We must flip the active topology's status based on
+        // what actually ran, not on the stage label.
+        //
+        //   deploy === "success"    → flip to live
+        //   deploy === "failed"     → flip to failed
+        //   deploy === "incomplete" → DON'T flip (stream died mid-call,
+        //                             Azure may still be processing —
+        //                             user should check the portal)
+        //                             but still persist topology/bicep.
+        if (activeTopologyId && deploy) {
           const statusUpdate: { status?: "live" | "failed" } = {};
-          if (outcome === "success") statusUpdate.status = "live";
-          else if (outcome === "failed") statusUpdate.status = "failed";
-          // outcome === "incomplete" → leave status alone
+          if (deploy === "success") statusUpdate.status = "live";
+          else if (deploy === "failed") statusUpdate.status = "failed";
 
-          const updated = await patchTopology(activeTopologyId, {
-            ...statusUpdate,
-            ...(topologyAtTurn ? { topology: topologyAtTurn } : {}),
-            ...(bicepAtTurn ? { bicep: bicepAtTurn } : {}),
-          });
-          setTopologies((cur) =>
-            cur.map((t) => (t.id === updated.id ? updated : t))
-          );
+          if (statusUpdate.status || topologyAtTurn || bicepAtTurn) {
+            const updated = await patchTopology(activeTopologyId, {
+              ...statusUpdate,
+              ...(topologyAtTurn ? { topology: topologyAtTurn } : {}),
+              ...(bicepAtTurn ? { bicep: bicepAtTurn } : {}),
+            });
+            setTopologies((cur) =>
+              cur.map((t) => (t.id === updated.id ? updated : t))
+            );
+          }
           return;
         }
 
@@ -430,11 +521,14 @@ function AppInner() {
           current={current}
           topologies={topologies}
           activeTopologyId={activeTopologyId}
+          templatesRefreshKey={templatesRefreshKey}
           onSelect={select}
           onSelectTopology={handleSelectTopology}
           onNewTopology={() => void handleNewTopology()}
           onRenameTopology={(t, newName) => void handleRenameTopology(t, newName)}
           onDeleteTopology={(t) => void handleDeleteTopology(t)}
+          onLoadTemplate={(t) => void handleLoadTemplate(t)}
+          onDeleteTemplate={(t) => void handleDeleteTemplate(t)}
           onDestroyTopology={async (t) => {
             const ok = await confirm({
               title: `Destroy topology '${t.name}'?`,
@@ -484,6 +578,7 @@ function AppInner() {
             onSchedule={() => setSchedulerOpen(true)}
             onAutoPromptConsumed={() => setAutoPrompt(null)}
             onPendingDestroyConsumed={() => setPendingDestroy(null)}
+            onTemplateSaved={() => setTemplatesRefreshKey((k) => k + 1)}
             onTurnComplete={persistBuildAfterTurn}
           />
         </main>

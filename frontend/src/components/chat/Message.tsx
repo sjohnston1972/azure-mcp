@@ -117,6 +117,7 @@ export function Message({ msg, chipsActive = false, onPickAnswer }: Props) {
               input={b.input}
               resultPending={b.resultPending}
               isError={b.isError}
+              resultPreview={b.resultPreview}
             />
           );
         })}

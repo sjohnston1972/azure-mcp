@@ -2,7 +2,8 @@
 // project), History, Templates.
 
 import { useEffect, useState } from "react";
-import type { Project, TopologyRecord } from "../../lib/types";
+import type { Project, Template, TopologyRecord } from "../../lib/types";
+import { listTemplates } from "../../lib/api";
 import { TopologiesList } from "./TopologiesList";
 
 type Deployment = {
@@ -14,14 +15,6 @@ type Deployment = {
   created_at: string;
 };
 
-type Template = {
-  id: string;
-  name: string;
-  description: string | null;
-  bicep: string;
-  created_at: string;
-};
-
 type Tab = "topologies" | "history" | "templates";
 
 type Props = {
@@ -29,12 +22,17 @@ type Props = {
   current: Project | null;
   topologies: TopologyRecord[];
   activeTopologyId: string | null;
+  /** Bumped by App after a save/delete to force the templates list
+   *  to reload without the user having to flip tabs. */
+  templatesRefreshKey?: number;
   onSelect: (p: Project) => void;
   onSelectTopology: (t: TopologyRecord) => void;
   onNewTopology: () => void;
   onRenameTopology: (t: TopologyRecord, newName: string) => void;
   onDeleteTopology: (t: TopologyRecord) => void;
   onDestroyTopology: (t: TopologyRecord) => void;
+  onLoadTemplate: (t: Template) => void;
+  onDeleteTemplate: (t: Template) => void;
 };
 
 export function LeftRail({
@@ -42,12 +40,15 @@ export function LeftRail({
   current,
   topologies,
   activeTopologyId,
+  templatesRefreshKey,
   onSelect,
   onSelectTopology,
   onNewTopology,
   onRenameTopology,
   onDeleteTopology,
   onDestroyTopology,
+  onLoadTemplate,
+  onDeleteTemplate,
 }: Props) {
   const [collapsed, setCollapsed] = useState(false);
   void onSelect; // projects no longer have a rail entry; the header switcher owns selection
@@ -67,12 +68,11 @@ export function LeftRail({
         .then((rows: Deployment[]) => setDeployments(rows))
         .catch(() => setDeployments([]));
     } else if (tab === "templates") {
-      fetch("/api/templates")
-        .then((r) => (r.ok ? r.json() : []))
-        .then((rows: Template[]) => setTemplates(rows))
+      listTemplates()
+        .then((rows) => setTemplates(rows))
         .catch(() => setTemplates([]));
     }
-  }, [tab, collapsed, current?.id]);
+  }, [tab, collapsed, current?.id, templatesRefreshKey]);
 
   const W = collapsed ? "w-16" : "w-64";
 
@@ -136,7 +136,14 @@ export function LeftRail({
             )
           )}
           {tab === "history" && <DeploymentsList items={deployments} />}
-          {tab === "templates" && <TemplatesList items={templates} />}
+          {tab === "templates" && (
+            <TemplatesList
+              items={templates}
+              hasProject={!!current}
+              onLoad={onLoadTemplate}
+              onDelete={onDeleteTemplate}
+            />
+          )}
         </div>
       )}
     </aside>
@@ -227,7 +234,17 @@ function DeploymentsList({ items }: { items: Deployment[] }) {
   );
 }
 
-function TemplatesList({ items }: { items: Template[] }) {
+function TemplatesList({
+  items,
+  hasProject,
+  onLoad,
+  onDelete,
+}: {
+  items: Template[];
+  hasProject: boolean;
+  onLoad: (t: Template) => void;
+  onDelete: (t: Template) => void;
+}) {
   if (items.length === 0)
     return (
       <p className="text-xs text-on-surface-variant">
@@ -235,20 +252,42 @@ function TemplatesList({ items }: { items: Template[] }) {
       </p>
     );
   return (
-    <ul className="space-y-2">
+    <ul className="flex flex-col gap-2 list-none p-0 m-0">
       {items.map((t) => (
         <li
           key={t.id}
-          className="rounded-lg bg-surface-container-low p-2.5 text-xs"
+          className="rounded-lg bg-surface-container-low p-2.5 text-xs group hover:bg-surface-container-high transition-colors"
         >
-          <div className="text-sm font-semibold truncate">{t.name}</div>
-          {t.description && (
-            <p className="text-[11px] text-on-surface-variant line-clamp-2 mt-0.5">
-              {t.description}
-            </p>
-          )}
-          <div className="mt-1 text-[10px] text-on-surface-variant">
-            {new Date(t.created_at).toLocaleDateString()}
+          <div className="flex items-start gap-2">
+            <button
+              type="button"
+              onClick={() => onLoad(t)}
+              disabled={!hasProject}
+              title={
+                hasProject
+                  ? `Load '${t.name}' as a new topology in this project`
+                  : "Pick a project first to load a template"
+              }
+              className="flex-1 min-w-0 text-left disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <div className="text-sm font-semibold truncate">{t.name}</div>
+              {t.description && (
+                <p className="text-[11px] text-on-surface-variant line-clamp-2 mt-0.5">
+                  {t.description}
+                </p>
+              )}
+              <div className="mt-1 text-[10px] text-on-surface-variant">
+                {new Date(t.created_at).toLocaleDateString()}
+              </div>
+            </button>
+            <button
+              type="button"
+              onClick={() => onDelete(t)}
+              title={`Delete template '${t.name}'`}
+              className="shrink-0 inline-flex items-center justify-center w-7 h-7 rounded-md text-error border border-error/40 hover:bg-error/10 transition-colors opacity-60 group-hover:opacity-100"
+            >
+              <span className="material-symbols-outlined text-base">delete</span>
+            </button>
           </div>
         </li>
       ))}

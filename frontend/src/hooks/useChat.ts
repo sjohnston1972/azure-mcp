@@ -18,24 +18,35 @@ import { parseBicep } from "../lib/parse-bicep";
 let _idCounter = 0;
 const nextId = () => `m_${Date.now()}_${++_idCounter}`;
 
-/** Outcome of a turn for status-flip decisions:
- *   - "success"    → flip to live / destroyed
- *   - "failed"     → flip to failed
- *   - "incomplete" → leave status unchanged (e.g. stream died mid-tool;
- *                    Azure may still be processing — user should check)
- *   - "noop"       → not a stage that flips status (build, view, free)
+/** Outcome of a single tool's last invocation in a turn:
+ *   - "success"    → tool resolved without is_error
+ *   - "failed"     → tool resolved with is_error
+ *   - "incomplete" → tool_use sent but tool_result never arrived (stream
+ *                    died mid-call; Azure may still be processing —
+ *                    user should check the portal)
+ *   - null         → tool was not called this turn at all
  */
+export type ToolStatus = "success" | "failed" | "incomplete" | null;
+
+/** Convenience aggregate kept for back-compat with callers that only
+ *  cared about a single yes/no outcome. Computed from deploy/destroy
+ *  outcomes — see TurnOutcomeInfo. */
 export type TurnOutcome = "success" | "failed" | "incomplete" | "noop";
+
+export type TurnOutcomeInfo = {
+  stage: Stage;
+  /** Outcome of the LAST deploy_bicep call this turn, if any. */
+  deploy: ToolStatus;
+  /** Outcome of the LAST destroy_azure call this turn, if any. */
+  destroy: ToolStatus;
+  userPrompt: string;
+};
 
 type Callbacks = {
   onTopology?: (t: Topology) => void;
   onBicep?: (b: string) => void;
   /** Fires when an assistant turn fully completes. */
-  onTurnComplete?: (info: {
-    stage: Stage;
-    outcome: TurnOutcome;
-    userPrompt: string;
-  }) => void;
+  onTurnComplete?: (info: TurnOutcomeInfo) => void;
 };
 
 function buildPushPrompt(
@@ -221,9 +232,14 @@ export function useChat(cb: Callbacks = {}) {
               },
             ]);
           } else if (evt.event === "tool_result") {
-            const { id, is_error } = JSON.parse(evt.data) as {
+            const {
+              id,
+              is_error,
+              content_preview,
+            } = JSON.parse(evt.data) as {
               id: string;
               is_error: boolean;
+              content_preview?: string;
             };
             const entry = toolResults.find((t) => t.id === id);
             if (entry) {
@@ -232,7 +248,12 @@ export function useChat(cb: Callbacks = {}) {
             updateAssistant((blocks) =>
               blocks.map((b) =>
                 b.type === "tool" && b.id === id
-                  ? { ...b, resultPending: false, isError: Boolean(is_error) }
+                  ? {
+                      ...b,
+                      resultPending: false,
+                      isError: Boolean(is_error),
+                      resultPreview: content_preview,
+                    }
                   : b
               )
             );
@@ -278,17 +299,17 @@ export function useChat(cb: Callbacks = {}) {
                   : m
               )
             );
-            // Outcome decision (used to flip topology status). Three
-            // cases per stage:
-            //   - LAST relevant tool call resolved with success  → "success"
-            //   - LAST relevant tool call resolved with failure  → "failed"
-            //   - LAST relevant tool call still unresolved (stream died
-            //     before tool_result arrived)                   → "incomplete"
-            //   - No relevant tool call happened at all          → "incomplete"
+            // Per-tool outcome (used by App to flip topology status).
+            // We compute these regardless of stage because the user can
+            // — and frequently does — type a follow-up message after a
+            // failed push (which goes out as stage='build') and Claude
+            // retries deploy_bicep within that build turn. The stage
+            // label is unreliable; what actually ran is reliable.
             //
-            // Stream-level errors AFTER a fully resolved success do
-            // NOT count as a failure — the resources are live, the
-            // stream cutting off is just noise.
+            // Per tool:
+            //   - LAST resolved call's is_error  → "success" / "failed"
+            //   - LAST call still unresolved     → "incomplete"
+            //   - Tool never called this turn    → null
             const lastDeploy = [...toolResults]
               .reverse()
               .find((t) => t.name === "deploy_bicep");
@@ -296,22 +317,18 @@ export function useChat(cb: Callbacks = {}) {
               .reverse()
               .find((t) => t.name === "destroy_azure");
 
-            const outcomeFor = (
+            const statusFor = (
               tool: typeof lastDeploy
-            ): TurnOutcome => {
-              if (!tool) return "incomplete";
+            ): ToolStatus => {
+              if (!tool) return null;
               if (!tool.outcome.resolved) return "incomplete";
               return tool.outcome.isError ? "failed" : "success";
             };
 
-            let outcome: TurnOutcome;
-            if (stage === "push") outcome = outcomeFor(lastDeploy);
-            else if (stage === "teardown") outcome = outcomeFor(lastDestroy);
-            else outcome = "noop";
-
             cbRef.current.onTurnComplete?.({
               stage,
-              outcome,
+              deploy: statusFor(lastDeploy),
+              destroy: statusFor(lastDestroy),
               userPrompt: text,
             });
           }

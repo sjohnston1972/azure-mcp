@@ -42,3 +42,8 @@ docs/screenshots/package*.json
 # ─── Misc ─────────────────────────────────────────────────────────
 .tmp/
 tmp/
+
+# ─── Debug paste artefacts ────────────────────────────────────────
+# Chat transcripts the user pastes locally for debugging — keep out
+# of the repo so they don't accumulate as project history.
+issue logs/

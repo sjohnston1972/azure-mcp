@@ -55,6 +55,37 @@ const STAGE_GUARD: Record<ChatStage, string> = {
 // Maximum number of agentic loop turns. Stops a runaway tool spiral.
 const MAX_TURNS = 25;
 
+// Cap the tool-result content preview pushed over SSE to the browser.
+// The FULL result still goes back to Claude — this just keeps the UI
+// payload manageable. ~6 KB fits long BCP error lists comfortably.
+const TOOL_RESULT_PREVIEW_LIMIT = 6000;
+
+function previewToolContent(
+  content: string | Anthropic.ToolResultBlockParam["content"]
+): string {
+  if (typeof content === "string") {
+    return content.length > TOOL_RESULT_PREVIEW_LIMIT
+      ? content.slice(0, TOOL_RESULT_PREVIEW_LIMIT) + "\n…[truncated]"
+      : content;
+  }
+  if (Array.isArray(content)) {
+    const text = content
+      .map((b) => {
+        if (typeof b === "string") return b;
+        if (b && typeof b === "object" && "type" in b && b.type === "text" && "text" in b) {
+          return (b as { text: string }).text;
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+    return text.length > TOOL_RESULT_PREVIEW_LIMIT
+      ? text.slice(0, TOOL_RESULT_PREVIEW_LIMIT) + "\n…[truncated]"
+      : text;
+  }
+  return "";
+}
+
 // Anthropic SDK call timeout — single API turn (one streamed response
 // from Claude). Hub-and-spoke planning + Bicep generation is the
 // largest case we've seen; 5 minutes is generous.
@@ -283,7 +314,27 @@ export async function chatRoutes(app: FastifyInstance) {
         for (const t of toolUses) {
           sse("tool_use", { id: t.id, name: t.name, input: t.input });
           const r = await callMcpTool(t.name, t.input);
-          sse("tool_result", { id: t.id, is_error: r.is_error });
+
+          // Send a content preview to the frontend so the user can
+          // expand the tool block and see what actually came back.
+          // Truncate to keep SSE payloads sane; the FULL content still
+          // goes to Claude via toolResults below.
+          const preview = previewToolContent(r.content);
+          sse("tool_result", {
+            id: t.id,
+            is_error: r.is_error,
+            content_preview: preview,
+          });
+
+          // Also log failures to backend stdout so `docker compose logs`
+          // shows the BCP errors / az output without needing the chat UI.
+          if (r.is_error) {
+            app.log.warn(
+              { tool: t.name, preview: preview.slice(0, 1500) },
+              `[chat] tool '${t.name}' returned is_error`
+            );
+          }
+
           toolResults.push({
             type: "tool_result",
             tool_use_id: t.id,

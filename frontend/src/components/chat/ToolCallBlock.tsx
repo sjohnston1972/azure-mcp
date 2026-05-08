@@ -8,9 +8,16 @@ type Props = {
   input: unknown;
   resultPending: boolean;
   isError: boolean;
+  resultPreview?: string;
 };
 
-export function ToolCallBlock({ name, input, resultPending, isError }: Props) {
+export function ToolCallBlock({
+  name,
+  input,
+  resultPending,
+  isError,
+  resultPreview,
+}: Props) {
   const [open, setOpen] = useState(false);
 
   const status = resultPending
@@ -46,13 +53,35 @@ export function ToolCallBlock({ name, input, resultPending, isError }: Props) {
       </button>
 
       {open && (
-        <div className="border-t border-outline-variant/30 px-3 py-2 bg-surface-container-lowest">
-          <div className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant mb-1">
-            input
+        <div className="border-t border-outline-variant/30 px-3 py-2 bg-surface-container-lowest space-y-3">
+          <div>
+            <div className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant mb-1">
+              input
+            </div>
+            <pre className="font-mono text-xs whitespace-pre-wrap break-words text-on-surface max-h-72 overflow-auto">
+              {JSON.stringify(input, null, 2)}
+            </pre>
           </div>
-          <pre className="font-mono text-xs whitespace-pre-wrap break-words text-on-surface">
-            {JSON.stringify(input, null, 2)}
-          </pre>
+          {!resultPending && resultPreview && (
+            <div>
+              <div
+                className={`text-[10px] font-extrabold uppercase tracking-widest mb-1 ${
+                  isError ? "text-error" : "text-on-surface-variant"
+                }`}
+              >
+                {isError ? "error output" : "result"}
+              </div>
+              <pre
+                className={`font-mono text-xs whitespace-pre-wrap break-words max-h-96 overflow-auto rounded p-2 ${
+                  isError
+                    ? "bg-error/5 text-on-surface border border-error/30"
+                    : "bg-surface-container-low text-on-surface"
+                }`}
+              >
+                {resultPreview}
+              </pre>
+            </div>
+          )}
         </div>
       )}
     </div>

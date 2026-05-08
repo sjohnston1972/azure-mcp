@@ -55,6 +55,9 @@ export type AssistantBlock =
       // Result lands later via the matching tool_result SSE event.
       resultPending: boolean;
       isError: boolean;
+      /** Text content the tool returned, truncated by the backend.
+       *  Populated when the tool_result event arrives. */
+      resultPreview?: string;
     };
 
 // Project shape from the backend.
