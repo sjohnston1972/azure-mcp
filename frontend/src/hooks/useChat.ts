@@ -64,10 +64,21 @@ function buildPushPrompt(
   if (topologyId) requiredTags["mcp-topology-id"] = topologyId;
   const requiredTagsJson = JSON.stringify(requiredTags);
 
+  // Detect the multi-file convention: the user-approved Bicep may
+  // contain `// === FILE: <name>.bicep ===` separators, in which case
+  // each chunk is a separate file. The push prompt has to tell Claude
+  // to call deploy_bicep with `files` (not `bicep`) in that case.
+  const isMultiFile = bicep ? /^\s*\/\/\s*===\s*FILE\s*:/m.test(bicep) : false;
+
+  const paramHint = isMultiFile
+    ? `\`files\` = the multi-file template below split by the \`// === FILE: <name>.bicep ===\` separators (each section becomes one entry in the files map; the first must be \`main.bicep\`); ` +
+      `\`entry\` = 'main.bicep' (default); `
+    : `\`bicep\` = the template below verbatim (do NOT regenerate, rename, simplify, or modify it); `;
+
   const head =
     `Push the architecture to Azure now. ` +
     `Call the \`deploy_bicep\` tool ONCE with these parameters: ` +
-    `\`bicep\` = the template below verbatim (do NOT regenerate, rename, simplify, or modify it); ` +
+    paramHint +
     `\`scope\` = 'subscription' if the template starts with \`targetScope = 'subscription'\` else 'resourceGroup' (with \`resource_group_name\` set); ` +
     `\`location\` = 'uksouth' (or the location the template targets); ` +
     `\`required_tags\` = ${requiredTagsJson} (the tool merges these onto every resource — pass them whether or not they're already in the Bicep). ` +

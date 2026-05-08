@@ -63,16 +63,34 @@ Rules for \`<bicep>\`:
 - Wrap a deployable Bicep template that creates exactly the architecture in the topology marker.
 - \`targetScope = 'subscription'\` if the build creates a resource group; otherwise omit (resource-group scope is the default).
 - Tag every resource (or the parent resource group, since tags inherit) with \`mcp-project = <project name>\` (and \`mcp-topology-id\` when an active topology is set). Use the \`mcp-\` prefix verbatim — not \`azure-mcp-\` (some Azure resource providers reject the \`azure-\` prefix on user tags).
+- **Multi-file form**: when your design needs more than one \`.bicep\` file (sub-scope entry + RG-scope module, multi-region modules, etc.), put each file inside the marker separated by a \`// === FILE: <name>.bicep ===\` line. The first file MUST be named \`main.bicep\` and is the deployment entry. Example:
+\`\`\`
+<bicep>
+// === FILE: main.bicep ===
+targetScope = 'subscription'
+...
+module net './network.bicep' = { scope: rg, params: { ... } }
 
-**Bicep template MUST be self-contained and compile.** Before emitting the final \`<bicep>\` marker, call \`validate_bicep\` with the template you're about to send. If validation fails, fix the errors and call it again. Only emit the marker once it compiles clean. Specific rules to avoid common compile errors:
-- **No external file references — EVER.** A \`module\` declaration's path string MUST start with \`br/public:avm/\`. Any other value — \`'./foo.bicep'\`, \`'foo.bicep'\`, \`'inline-net.bicep'\`, \`'network'\`, \`'inline-network'\`, an empty string, anything — is a reference to a sibling file that does NOT exist. Bicep will fail with \`BCP091: Could not find file '/work/<path>'\`. Do not write such a module declaration even as a placeholder, scaffold, or "I'll fill this in later" stub. **If the path doesn't start with \`br/public:avm/\`, delete the entire module block.** Use one of the two legal forms instead:
-  1. **Public AVM registry**: \`module x 'br/public:avm/res/...:<version>' = { ... }\`. Pattern modules (\`avm/ptn/...\`) are unreliable — prefer \`avm/res/...\`.
-  2. **Inline ARM template** via a \`Microsoft.Resources/deployments\` resource with a \`template:\` object literal. Use this when you need to wrap a block of RG-scoped resources inside a sub-scope template. This is a \`resource\` declaration, NOT a \`module\` declaration — so there's nothing to reference.
-- **No refactoring leftovers.** When you replace one approach (e.g. a module reference) with another (e.g. an inline \`Microsoft.Resources/deployments\`), DELETE the abandoned block entirely. Do not leave it commented out, do not leave it as a stub with empty \`params: {}\`, do not write a comment that says "we can't do X" alongside code that does X. Validation walks every line — vestigial code that was already wrong before is still wrong.
-- **Sub-scope template structure.** When \`targetScope = 'subscription'\`, only sub-scope-valid resources (\`Microsoft.Resources/resourceGroups\`, \`Microsoft.Resources/deployments\`, etc.) can sit at the top level. RG-scoped resources (VNets, VMs, NSGs, Bastions) must either: (a) be wrapped in a \`module ... = { scope: rg, ... }\` that targets a public AVM module or another sub-scope-valid resource, or (b) live inside the \`template.resources\` array of a \`Microsoft.Resources/deployments\` resource that has \`resourceGroup: rg.name\`.
+// === FILE: network.bicep ===
+@description('...')
+param ...
+...
+</bicep>
+\`\`\`
+The host parses these markers and passes them as the \`files\` parameter to \`deploy_bicep\` automatically. When you call \`deploy_bicep\` or \`validate_bicep\` yourself in this multi-file shape, use the \`files\` parameter (object map of filename → content) and either let \`entry\` default to \`main.bicep\` or set it explicitly.
+
+**Bicep template MUST compile.** Before emitting the final \`<bicep>\` marker, call \`validate_bicep\`. If it fails, fix and call it again. Only emit once it compiles clean. Specific rules:
+
+- **Multi-file Bicep is supported and PREFERRED for non-trivial designs.** Both \`validate_bicep\` and \`deploy_bicep\` accept a \`files\` parameter (object map: filename → content) and \`entry\` (defaults to \`main.bicep\`). When you use it, local module references like \`module net './network.bicep' = { scope: rg, ... }\` resolve naturally because the tool writes every file in the map into a workspace directory before running \`az bicep build\` / \`az deployment\`. This is the right pattern for any architecture that crosses scope boundaries (sub → RG, multi-RG, multi-region).
+- **Module path rules.** Three legal forms:
+  1. \`module x './foo.bicep' = { ... }\` — \`foo.bicep\` MUST be present in the \`files\` map you pass to the tool. If you write this, you MUST use the \`files\` form (not \`bicep\`).
+  2. \`module x 'br/public:avm/res/...:<version>' = { ... }\` — public AVM registry. Pattern modules (\`avm/ptn/...\`) are unreliable — prefer \`avm/res/...\`.
+  3. Inline ARM template via a \`Microsoft.Resources/deployments\` resource with a \`template:\` object literal. **Avoid this for cross-scope or expression-heavy templates** — Bicep's \`[\` escaping mangles ARM expression strings inside the inline template, producing "malformed resourceId" errors at deploy time. If you find yourself writing \`'[resourceId(...)]'\` strings inside an inline \`Microsoft.Resources/deployments\`, switch to multi-file with proper \`module\` blocks.
+- **Single-file form is still fine** when there's no need for sub-scope wrapping or local modules — e.g. a single resource group with a small set of resources, or AVM-only modules. Use the \`bicep\` parameter as a string in that case.
+- **No refactoring leftovers.** When you replace one approach with another, DELETE the abandoned block entirely. Do not leave stub modules with empty \`params: {}\`, do not leave commented-out code, do not write "we can't do X" alongside code that does X. Validation walks every line.
+- **Sub-scope template structure.** When \`targetScope = 'subscription'\`, only sub-scope-valid resources (\`Microsoft.Resources/resourceGroups\`, \`Microsoft.Resources/deployments\`, etc.) can sit at the top level. RG-scoped resources (VNets, VMs, NSGs, Bastions) must be wrapped in a \`module ... = { scope: rg, ... }\` — that module can be (a) a local file in the \`files\` map, or (b) a public AVM registry path. The third option (inline \`Microsoft.Resources/deployments\` with template literal) works for trivial cases but breaks on \`[resourceId(...)]\` strings — see above.
 - **AVM modules must exist.** Only reference AVM modules whose versions you are certain exist on the public registry (e.g. \`br/public:avm/res/network/virtual-network:0.5.0\`). Do NOT invent paths like \`avm/ptn/network/hub-spoke:0.0.0\` — pattern modules at \`0.0.0\` rarely exist. When in doubt, write the resource declaration inline rather than reach for a non-existent module.
 - **\`newGuid()\` and \`utcNow()\` are restricted.** They can ONLY be used as parameter default values, not in \`var\` blocks or expressions. The right pattern is: \`param deploymentId string = newGuid()\` then reference \`deploymentId\` everywhere.
-- **Single self-contained file.** Even for multi-resource architectures (hub + 2 spokes + peerings + NSGs), keep it all in one .bicep template. Validation runs the file in isolation.
 - **\`location\` consistency.** Don't mix \`location = 'uksouth'\` literals with \`location = location\` — pick one source per resource and stick with it.
 
 ### Parameter defaults (CRITICAL)
