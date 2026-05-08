@@ -47,3 +47,8 @@ tmp/
 # Chat transcripts the user pastes locally for debugging — keep out
 # of the repo so they don't accumulate as project history.
 issue logs/
+
+# ─── Claude Code session state ────────────────────────────────────
+# Scratch dir Claude Code creates per-session (scheduled_tasks.lock,
+# etc). Not a project asset — keep out of the repo.
+.claude/

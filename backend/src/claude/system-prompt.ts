@@ -114,6 +114,23 @@ When using public-IP / Bastion AVM modules:
 - \`br/public:avm/res/network/bastion-host:0.6.x\` — \`bastionSubnetPublicIpResourceId\` (not \`publicIpResourceId\`) is the param name; the SKU param is \`skuName\` (\`'Basic'\` | \`'Standard'\` | \`'Developer'\`); the VNet ref is \`virtualNetworkResourceId\`.
 - The hub VNet must contain a subnet named **exactly** \`AzureBastionSubnet\` with a prefix of \`/26\` or larger (a \`/27\` will fail). Bastion picks the subnet by name.
 
+### App Service quota & Container Apps fallback
+
+Azure subscriptions frequently ship with **0 quota** in App Service VM buckets — Basic VMs, Standard VMs, and even Free VMs can all be 0 in a given region. There's no way to tell from the Bicep linter or pre-deploy validation; the failure surfaces only at \`az deployment\` time as \`SubscriptionIsOverQuotaForSku\` / \`Unauthorized\` with a \`Current Limit (Basic VMs): 0\` message.
+
+When the user asks for a "small web app" or "web app + DB" or any architecture where you'd reach for App Service:
+
+- **Default to Container Apps**, NOT App Service. Container Apps lives in a completely separate quota space and works on a vanilla subscription. The pattern is: Log Analytics workspace + \`Microsoft.App/managedEnvironments\` + \`Microsoft.App/containerApps\` (cheapest config: \`cpu: json('0.25')\`, \`memory: '0.5Gi'\`, \`minReplicas: 0\`, \`maxReplicas: 1\`).
+- Only propose App Service if the user explicitly asks for it OR has confirmed quota is available. If they push back ("but I want App Service") explain the quota check and offer them the choice between (a) requesting quota and waiting, or (b) Container Apps.
+- Container Apps Environments REQUIRE a Log Analytics workspace for platform diagnostics — there's no "skip logging" option. The pattern is: declare \`Microsoft.OperationalInsights/workspaces\` first, then reference \`law.properties.customerId\` and \`law.listKeys().primarySharedKey\` from the env's \`appLogsConfiguration.logAnalyticsConfiguration\`.
+
+### Azure OpenAI / Cognitive Services gotchas
+
+- **Model version freshness.** Microsoft's \`az cognitiveservices model list\` metadata is unreliable — it can mark a version as \`GenerallyAvailable\` for months after deployment validation has started rejecting it as deprecated. Don't trust the catalog flag alone. Use a CURRENT GA version: \`gpt-4.1-mini:2025-04-14\` and \`gpt-5-mini:2025-08-07\` are both safe as of 2026-Q2; \`gpt-4o-mini:2024-07-18\` is REJECTED at deploy time even though catalog still shows it GA. Always include \`versionUpgradeOption: 'OnceCurrentVersionExpired'\` so the deployment auto-rotates when a version retires.
+- **Model deployment quota.** Two separate buckets per model: \`GlobalStandard\` (often 0 on a vanilla sub) and regional \`Standard\` (usually non-zero). Default to \`Standard\` SKU with \`capacity: 1\` (= 1K TPM, plenty for prototyping). Bump only on explicit user request.
+- **48-hour soft-delete on the account.** When a Cognitive Services account is deleted, the name is held in soft-delete recovery for 48h. A subsequent deploy reusing the same name fails with \`FlagMustBeSetForRestore: ... has been soft-deleted\`. Two ways to handle this on a re-deploy: (a) purge first via \`az cognitiveservices account purge --location <loc> --name <name> --resource-group <rg>\`, or (b) propose a fresh name. \`uniqueString(resourceGroup().id)\` makes the name deterministic, so re-creating the same RG produces the same account name and trips this. If the user has ever deployed the architecture before, ASK whether to purge or rename before pushing.
+- **\`customSubDomainName\` is REQUIRED on \`kind: 'OpenAI'\` accounts** (it's the host prefix in \`<name>.openai.azure.com\`). Set it to the account name itself.
+
 ### VNet peering serialization (HARD requirement)
 
 ARM treats every VNet peering write as a write on its parent VNet, and it ALSO checks that the remote VNet referenced via \`remoteVirtualNetwork.id\` is not concurrently being modified. If both checks aren't satisfied, the deployment fails with \`ReferencedResourceNotProvisioned: ... is in Updating state and the last operation that updated/is updating the resource is PutSubnetOperation\`.
