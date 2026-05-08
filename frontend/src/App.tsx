@@ -20,6 +20,7 @@ import { LeftRail } from "./components/rail/LeftRail";
 import { ProjectSwitcher } from "./components/projects/ProjectSwitcher";
 import { NewProjectModal } from "./components/projects/NewProjectModal";
 import { SchedulerModal } from "./components/scheduler/SchedulerModal";
+import { VmSelector } from "./components/azure/VmSelector";
 import { ConfirmProvider, useConfirm } from "./components/ui/useConfirm";
 import {
   createProject,
@@ -83,6 +84,7 @@ function AppInner() {
     { topologyId: string; key: number } | null
   >(null);
   const [githubStatus, setGithubStatus] = useState<GithubStatus | null>(null);
+  const [vmSelectorOpen, setVmSelectorOpen] = useState(false);
 
   // ── Project bootstrap + selection ────────────────────────────
   const refresh = useCallback(async () => {
@@ -395,6 +397,15 @@ function AppInner() {
         </span>
 
         <div className="ml-auto flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setVmSelectorOpen(true)}
+            title="Browse Azure VM sizes (free-tier highlighted)"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-outline-variant/40 hover:bg-surface-container-high transition-colors text-sm font-semibold text-on-surface-variant"
+          >
+            <span className="material-symbols-outlined text-base">memory</span>
+            VM sizes
+          </button>
           <ProjectSwitcher
             projects={projects}
             current={current}
@@ -488,6 +499,20 @@ function AppInner() {
         open={schedulerOpen}
         project={current}
         onClose={() => setSchedulerOpen(false)}
+      />
+
+      <VmSelector
+        open={vmSelectorOpen}
+        onClose={() => setVmSelectorOpen(false)}
+        onPick={(sku) => {
+          // Picking a SKU drops a build-stage prompt into the chat
+          // pinning that exact size. Reuses the autoPrompt path that
+          // example prompts on the empty canvas use.
+          setAutoPrompt({
+            text: `Design a single Linux VM using SKU ${sku}. Default region uksouth, smallest reasonable disk, system-assigned managed identity, no public IP. Tag everything per the project's mcp-* scheme.`,
+            key: Date.now(),
+          });
+        }}
       />
     </div>
   );

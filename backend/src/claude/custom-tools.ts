@@ -16,6 +16,7 @@ import { writeFile, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { config } from "../config.js";
+import { CURATED_VM_SKUS } from "../lib/vm-skus.js";
 
 const AZURE_CLI_IMAGE =
   process.env.AZURE_CLI_IMAGE ?? "mcr.microsoft.com/azure-cli:latest";
@@ -32,6 +33,28 @@ const WORKSPACE_VOLUME =
   process.env.AZURE_MCP_DEPLOY_VOLUME ?? "azure-mcp_azure-mcp-deploy-workspace";
 
 export const CUSTOM_TOOLS: Anthropic.Tool[] = [
+  {
+    name: "list_vm_skus",
+    description:
+      "Return the curated list of Azure VM SKUs the host knows about, with vCPU/RAM/disk specs, indicative monthly USD price, and a `free_tier` flag. Use this BEFORE proposing a VM size so you can: (1) default to `Standard_B1s` when the user hasn't specified — that's the only SKU eligible for Azure's 12-month free tier (750 hrs/mo on new accounts), and (2) match larger SKUs to the user's stated workload. Pricing is approximate (PAYG, Linux, East US) — flag that to the user, don't quote it as final. Optional filters: `family` (one of: burstable, general-purpose, memory-optimized, compute-optimized, gpu, legacy-basic), `free_tier_only` (true returns only the B1s entry).",
+    input_schema: {
+      type: "object",
+      properties: {
+        family: {
+          type: "string",
+          enum: [
+            "burstable",
+            "general-purpose",
+            "memory-optimized",
+            "compute-optimized",
+            "gpu",
+            "legacy-basic",
+          ],
+        },
+        free_tier_only: { type: "boolean" },
+      },
+    },
+  },
   {
     name: "validate_bicep",
     description:
@@ -136,9 +159,40 @@ export async function callCustomTool(
   if (name === "validate_bicep") {
     return runValidateBicep(input as { bicep?: string });
   }
+  if (name === "list_vm_skus") {
+    return runListVmSkus(
+      input as { family?: string; free_tier_only?: boolean }
+    );
+  }
   return {
     content: `unknown custom tool: ${name}`,
     is_error: true,
+  };
+}
+
+async function runListVmSkus(input: {
+  family?: string;
+  free_tier_only?: boolean;
+}): Promise<{ content: string; is_error: boolean }> {
+  let skus = CURATED_VM_SKUS;
+  if (input.family) {
+    skus = skus.filter((s) => s.family === input.family);
+  }
+  if (input.free_tier_only) {
+    skus = skus.filter((s) => s.free_tier);
+  }
+  return {
+    content: JSON.stringify(
+      {
+        count: skus.length,
+        free_tier_note:
+          "Azure's 12-month free tier covers 750 hrs/mo of B1s Linux + 750 hrs/mo of B1s Windows on NEW accounts. There is no perpetual VM free tier.",
+        skus,
+      },
+      null,
+      2
+    ),
+    is_error: false,
   };
 }
 
