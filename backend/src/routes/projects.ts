@@ -12,10 +12,13 @@ import {
   GitHubError,
 } from "../lib/github.js";
 
+type Cloud = "azure" | "aws";
+
 type ProjectRow = {
   id: string;
   name: string;
   description: string | null;
+  cloud: Cloud;
   github_repo: string | null;
   github_synced_at: string | null;
   created_at: string;
@@ -23,16 +26,29 @@ type ProjectRow = {
 };
 
 const PROJECT_COLS =
-  "id, name, description, github_repo, github_synced_at, created_at, updated_at";
+  "id, name, description, cloud, github_repo, github_synced_at, created_at, updated_at";
 
 export async function projectRoutes(app: FastifyInstance) {
-  // List projects, newest-first.
-  app.get("/api/projects", async () => {
-    const { rows } = await pool.query<ProjectRow>(
-      `SELECT ${PROJECT_COLS} FROM projects ORDER BY updated_at DESC`
-    );
-    return rows;
-  });
+  // List projects, newest-first. Optional ?cloud=azure|aws filter so
+  // the frontend can fetch only the projects matching the active
+  // cloud toggle without leaking cross-cloud rows into the dropdown.
+  app.get<{ Querystring: { cloud?: string } }>(
+    "/api/projects",
+    async (req) => {
+      const cloud = req.query.cloud;
+      if (cloud === "azure" || cloud === "aws") {
+        const { rows } = await pool.query<ProjectRow>(
+          `SELECT ${PROJECT_COLS} FROM projects WHERE cloud = $1 ORDER BY updated_at DESC`,
+          [cloud]
+        );
+        return rows;
+      }
+      const { rows } = await pool.query<ProjectRow>(
+        `SELECT ${PROJECT_COLS} FROM projects ORDER BY updated_at DESC`
+      );
+      return rows;
+    }
+  );
 
   // Get one project.
   app.get<{ Params: { id: string } }>(
@@ -48,36 +64,40 @@ export async function projectRoutes(app: FastifyInstance) {
   );
 
   // Create.
-  app.post<{ Body: { name: string; description?: string } }>(
-    "/api/projects",
-    async (req, reply) => {
-      const { name, description } = req.body ?? {};
-      if (!name || typeof name !== "string" || name.trim().length === 0) {
-        return reply.code(400).send({ error: "name is required" });
-      }
-      // Project names go into Azure tags — restrict to characters that
-      // are safe there. Azure tag names allow most printable chars but
-      // the conservative subset is alphanumeric + dash/underscore.
-      if (!/^[a-zA-Z0-9_-]{1,60}$/.test(name)) {
-        return reply.code(400).send({
-          error: "name must be 1–60 chars, alphanumeric + dash/underscore only",
-        });
-      }
-      try {
-        const { rows } = await pool.query<ProjectRow>(
-          `INSERT INTO projects (name, description) VALUES ($1, $2) RETURNING ${PROJECT_COLS}`,
-          [name, description ?? null]
-        );
-        return reply.code(201).send(rows[0]);
-      } catch (err) {
-        // Duplicate name → 409.
-        if ((err as { code?: string }).code === "23505") {
-          return reply.code(409).send({ error: "project name already exists" });
-        }
-        throw err;
-      }
+  app.post<{
+    Body: { name: string; description?: string; cloud?: string };
+  }>("/api/projects", async (req, reply) => {
+    const { name, description } = req.body ?? {};
+    const cloud = req.body?.cloud ?? "azure";
+    if (cloud !== "azure" && cloud !== "aws") {
+      return reply.code(400).send({ error: "cloud must be 'azure' or 'aws'" });
     }
-  );
+    if (!name || typeof name !== "string" || name.trim().length === 0) {
+      return reply.code(400).send({ error: "name is required" });
+    }
+    // Project names go into cloud resource tags — restrict to
+    // characters that are safe across both Azure tags and AWS tags
+    // (the conservative subset is alphanumeric + dash/underscore).
+    if (!/^[a-zA-Z0-9_-]{1,60}$/.test(name)) {
+      return reply.code(400).send({
+        error: "name must be 1–60 chars, alphanumeric + dash/underscore only",
+      });
+    }
+    try {
+      const { rows } = await pool.query<ProjectRow>(
+        `INSERT INTO projects (name, description, cloud)
+         VALUES ($1, $2, $3) RETURNING ${PROJECT_COLS}`,
+        [name, description ?? null, cloud]
+      );
+      return reply.code(201).send(rows[0]);
+    } catch (err) {
+      // Duplicate name → 409.
+      if ((err as { code?: string }).code === "23505") {
+        return reply.code(409).send({ error: "project name already exists" });
+      }
+      throw err;
+    }
+  });
 
   // Patch (description only — renaming a project after resources have
   // been tagged with the old name would orphan them).

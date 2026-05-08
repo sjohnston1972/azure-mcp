@@ -390,7 +390,8 @@ export function useChat(cb: Callbacks = {}) {
       projectId: string | null,
       projectName: string | null,
       topologyId: string | null = null,
-      bicep: string | null = null
+      bicep: string | null = null,
+      cloud: "azure" | "aws" = "azure"
     ) => {
       const name = projectName ?? "<project>";
       const prompt =
@@ -401,9 +402,10 @@ export function useChat(cb: Callbacks = {}) {
             : null;
       if (!prompt) return;
       // Short label for the chat view — full prompt still goes to Claude.
+      const cloudName = cloud === "aws" ? "AWS" : "Azure";
       const displayText =
         stage === "push"
-          ? `🚀 Push to Azure`
+          ? `🚀 Push to ${cloudName}`
           : stage === "teardown"
             ? topologyId
               ? `🗑 Destroy this topology`

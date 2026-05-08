@@ -13,7 +13,7 @@ export async function mcpRoutes(app: FastifyInstance) {
   // MCP Server tools plus our in-process custom tools (deploy_bicep,
   // etc). Use /api/mcp/tools?upstream=true to see only the MCP server's
   // tools (without our additions).
-  app.get<{ Querystring: { upstream?: string } }>(
+  app.get<{ Querystring: { upstream?: string; cloud?: string } }>(
     "/api/mcp/tools",
     async (req) => {
       if (req.query.upstream === "true") {
@@ -28,8 +28,13 @@ export async function mcpRoutes(app: FastifyInstance) {
           })),
         };
       }
-      const tools = await getClaudeTools();
+      // Default to azure for the smoke test endpoint; pass ?cloud=aws
+      // to see the AWS-side tool list.
+      const cloud =
+        req.query.cloud === "aws" ? "aws" : ("azure" as "azure" | "aws");
+      const tools = await getClaudeTools(cloud);
       return {
+        cloud,
         count: tools.length,
         tools: tools.map((t) => ({
           name: t.name,

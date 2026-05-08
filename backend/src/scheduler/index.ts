@@ -89,7 +89,10 @@ async function runScheduleOnce(
     },
   ];
 
-  const tools = await getClaudeTools();
+  // Scheduler only runs Azure templates today (templates table doesn't
+  // carry a cloud field). Hardcoded — if/when AWS templates get
+  // scheduling, look up cloud from the saved template's source.
+  const tools = await getClaudeTools("azure");
   const messages: Anthropic.MessageParam[] = [
     { role: "user", content: userMessage },
   ];

@@ -1,0 +1,1 @@
+# placeholder so the docker-compose bind mount succeeds when AWS_HOST_CONFIG_PATH is not set

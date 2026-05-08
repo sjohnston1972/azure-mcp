@@ -100,6 +100,37 @@ export async function migrate(): Promise<void> {
   await pool.query(`
     ALTER TABLE templates ADD COLUMN IF NOT EXISTS topology JSONB;
   `);
+
+  // Multi-cloud: each project is single-cloud (Azure or AWS).
+  // Defaults to 'azure' for backward-compat with rows created before
+  // this column existed. Topologies inherit cloud from their project
+  // — we mirror it onto topologies for fast filtering on the rail.
+  await pool.query(`
+    ALTER TABLE projects ADD COLUMN IF NOT EXISTS cloud TEXT NOT NULL DEFAULT 'azure';
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'projects_cloud_check' AND conrelid = 'projects'::regclass
+      ) THEN
+        ALTER TABLE projects
+          ADD CONSTRAINT projects_cloud_check CHECK (cloud IN ('azure','aws'));
+      END IF;
+    END
+    $$;
+  `);
+  await pool.query(`
+    ALTER TABLE topologies ADD COLUMN IF NOT EXISTS cloud TEXT;
+  `);
+  // Backfill any topology rows that existed before the column was
+  // added, populating from their parent project.
+  await pool.query(`
+    UPDATE topologies t SET cloud = p.cloud
+    FROM projects p
+    WHERE t.project_id = p.id AND t.cloud IS NULL;
+  `);
   // eslint-disable-next-line no-console
   console.log("[db] migrations applied");
 }

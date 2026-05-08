@@ -18,6 +18,10 @@ import { downloadChatMarkdown } from "../../lib/export-chat";
 type Props = {
   projectName: string | null;
   projectId: string | null;
+  /** Cloud the active project targets — drives Push/Tear-down
+   *  copy ("Push to Azure" vs "Push to AWS") and any other
+   *  user-facing strings that shouldn't lie about the provider. */
+  cloud: "azure" | "aws";
   /** Active topology id — sent with every chat turn so Claude tags
    *  resources with `mcp-topology-id=<id>` and per-topology
    *  destroy can target precisely. */
@@ -68,6 +72,7 @@ type Props = {
 export function ChatPanel({
   projectName,
   projectId,
+  cloud,
   activeTopologyId,
   activeTopologyName,
   build,
@@ -162,7 +167,9 @@ export function ChatPanel({
       "teardown",
       projectId,
       projectName,
-      pendingDestroy.topologyId
+      pendingDestroy.topologyId,
+      null,
+      cloud
     );
     onPendingDestroyConsumed();
   }, [
@@ -201,13 +208,15 @@ export function ChatPanel({
     onBuildReset();
   };
 
+  const cloudName = cloud === "aws" ? "AWS" : "Azure";
   const handlePush = async () => {
     if (!projectName || !build?.bicep) return;
     const ok = await confirm({
-      title: `Deploy '${activeTopologyName ?? "topology"}' to Azure?`,
+      title: `Deploy '${activeTopologyName ?? "topology"}' to ${cloudName}?`,
       message: (
         <>
-          This will create <strong>live Azure resources</strong>, tagged with{" "}
+          This will create <strong>live {cloudName} resources</strong>,
+          tagged with{" "}
           <code className="font-mono text-[12px] px-1 py-0.5 rounded bg-surface-container-high">
             mcp-project={projectName}
           </code>
@@ -222,7 +231,7 @@ export function ChatPanel({
           . Every resource Claude proposed in the canvas will be created.
         </>
       ),
-      confirmLabel: "Push to Azure",
+      confirmLabel: `Push to ${cloudName}`,
       tone: "primary",
       icon: "rocket_launch",
     });
@@ -236,7 +245,8 @@ export function ChatPanel({
       projectId,
       projectName,
       activeTopologyId,
-      build?.bicep ?? null
+      build?.bicep ?? null,
+      cloud
     );
   };
 
@@ -246,7 +256,8 @@ export function ChatPanel({
       title: `Tear down everything in '${projectName}'?`,
       message: (
         <>
-          This deletes <strong>every</strong> Azure resource tagged with{" "}
+          This deletes <strong>every</strong> {cloudName} resource tagged
+          with{" "}
           <code className="font-mono text-[12px] px-1 py-0.5 rounded bg-surface-container-high">
             mcp-project={projectName}
           </code>
@@ -265,7 +276,7 @@ export function ChatPanel({
     lastStageRef.current = "teardown";
     turnTeardownTargetRef.current = null;
     // Project-wide tear-down: do NOT pass a topology_id.
-    await sendStaged("teardown", projectId, projectName, null);
+    await sendStaged("teardown", projectId, projectName, null, null, cloud);
   };
 
   return (
@@ -330,11 +341,13 @@ export function ChatPanel({
                 ready
               </div>
               <p className="text-sm leading-relaxed text-on-surface">
-                Ask me anything Azure-related. When you ask me to{" "}
+                Ask me anything {cloudName}-related. When you ask me to{" "}
                 <strong>design or modify</strong> an architecture, the
-                topology canvas and the Bicep drawer fill in automatically.
-                For chat or read-only questions they stay empty. Nothing
-                deploys until you click <strong>Push to Azure</strong>.
+                topology canvas and the{" "}
+                {cloud === "aws" ? "CloudFormation" : "Bicep"} drawer fill
+                in automatically. For chat or read-only questions they stay
+                empty. Nothing deploys until you click{" "}
+                <strong>Push to {cloudName}</strong>.
               </p>
             </div>
           )}

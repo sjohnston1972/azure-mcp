@@ -44,6 +44,26 @@
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
+/* ── AWS palette overrides ─────────────────────────────────────
+   When the cloud toggle is on AWS, the root <html> element gets
+   data-cloud="aws". We override the primary/inverse-primary tokens
+   to AWS's brand orange (#FF9900) and keep everything else intact.
+   Tailwind utilities like bg-primary, text-primary etc. all key
+   off these CSS variables, so the whole UI re-tints automatically.
+
+   We avoid touching --color-error so red still reads as failure. */
+html[data-cloud="aws"] {
+  --color-primary: #ff9900;
+  --color-primary-container: #ff7a00;
+  --color-on-primary: #1b1b1f;
+  --color-inverse-primary: #ffd599;
+
+  /* Lighter accent for hover/borders so AWS orange doesn't get too
+     loud against the white surface. */
+  --color-secondary: #232f3e;          /* AWS Squid Ink (header tint) */
+  --color-on-secondary: #ffffff;
+}
+
 /* ── Base styles ──────────────────────────────────────────────── */
 html, body, #root {
   height: 100%;

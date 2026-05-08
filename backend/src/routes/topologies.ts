@@ -24,6 +24,7 @@ type TopologyRow = {
   project_id: string;
   name: string;
   status: Status;
+  cloud: "azure" | "aws";
   topology: unknown;
   bicep: string | null;
   pushed_at: string | null;
@@ -36,7 +37,7 @@ type TopologyRow = {
 };
 
 const TOPOLOGY_COLS =
-  "id, project_id, name, status, topology, bicep, pushed_at, destroyed_at, " +
+  "id, project_id, name, status, cloud, topology, bicep, pushed_at, destroyed_at, " +
   "pushed_deployment_id, github_repo, github_synced_at, created_at, updated_at";
 
 export async function topologyRoutes(app: FastifyInstance) {
@@ -94,13 +95,23 @@ export async function topologyRoutes(app: FastifyInstance) {
       const count = Number(rows[0]?.count ?? 0);
       name = `untitled-${count + 1}`;
     }
+    // Inherit cloud from the parent project so each topology row
+    // self-describes its cloud — handy for the rail filter and for
+    // routing chat turns to the right system prompt.
+    const projRes = await pool.query<{ cloud: "azure" | "aws" }>(
+      "SELECT cloud FROM projects WHERE id = $1",
+      [b.project_id]
+    );
+    const projectCloud = projRes.rows[0]?.cloud ?? "azure";
+
     const { rows } = await pool.query<TopologyRow>(
-      `INSERT INTO topologies (project_id, name, topology, bicep)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
+      `INSERT INTO topologies (project_id, name, cloud, topology, bicep)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING ${TOPOLOGY_COLS}`,
       [
         b.project_id,
         name,
+        projectCloud,
         b.topology ? JSON.stringify(b.topology) : null,
         b.bicep ?? null,
       ]

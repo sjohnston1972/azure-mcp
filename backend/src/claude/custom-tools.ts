@@ -21,8 +21,14 @@ import { CURATED_VM_SKUS } from "../lib/vm-skus.js";
 const AZURE_CLI_IMAGE =
   process.env.AZURE_CLI_IMAGE ?? "mcr.microsoft.com/azure-cli:latest";
 
+// AWS CLI sidecar image. We use the v2 amazon/aws-cli image so we
+// can run `aws cloudformation deploy/validate-template/delete-stack`
+// directly. Same pattern as the Azure side: spawn one container per
+// invocation with the workspace volume + the host's SSO creds mounted.
+const AWS_CLI_IMAGE = process.env.AWS_CLI_IMAGE ?? "amazon/aws-cli:latest";
+
 // The shared volume mount path inside both the backend container and
-// the spawned azure-cli container (see docker-compose.yml).
+// the spawned azure-cli/aws-cli containers (see docker-compose.yml).
 const WORKSPACE = "/work";
 // Docker named volume that compose actually creates. The naming convention
 // is `<project>_<volume_key>` — for our compose file the project is
@@ -31,6 +37,31 @@ const WORKSPACE = "/work";
 // via env if you ever rename the project.
 const WORKSPACE_VOLUME =
   process.env.AZURE_MCP_DEPLOY_VOLUME ?? "azure-mcp_azure-mcp-deploy-workspace";
+
+// AWS auth via long-lived IAM access keys (mirrors the Azure
+// service-principal pattern). The backend container reads these
+// from .env via Compose, then passes them through to each spawned
+// aws-cli sidecar via -e flags. No ~/.aws mount needed for the
+// access-key path.
+const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID ?? "";
+const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY ?? "";
+const AWS_SESSION_TOKEN = process.env.AWS_SESSION_TOKEN ?? "";
+// Default AWS region used when a tool call doesn't override it. The
+// user can change this in the chat.
+const AWS_DEFAULT_REGION = process.env.AWS_DEFAULT_REGION ?? "us-east-1";
+
+// Optional fallback: SSO via mounted ~/.aws. Set if you'd rather use
+// AWS Identity Center than long-lived keys. The access-key path takes
+// precedence when both are configured.
+const AWS_HOST_CONFIG_PATH = process.env.AWS_HOST_CONFIG_PATH ?? "";
+const AWS_PROFILE = process.env.AWS_PROFILE ?? "";
+
+/** True when AWS auth is plumbed through (either via access keys or
+ *  via mounted SSO config). The deploy tools error with a clear hint
+ *  if neither is configured. */
+const AWS_AUTH_CONFIGURED =
+  Boolean(AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY) ||
+  Boolean(AWS_HOST_CONFIG_PATH);
 
 export const CUSTOM_TOOLS: Anthropic.Tool[] = [
   {
@@ -156,6 +187,113 @@ export const CUSTOM_TOOLS: Anthropic.Tool[] = [
       required: ["scope"],
     },
   },
+  // ── AWS tools ─────────────────────────────────────────────────
+  // Mirrored from the Azure trio. Backend plumbing is the same
+  // shape (sidecar container per call, workspace volume for the
+  // template file) — the cloud, IaC language, and CLI differ.
+  {
+    name: "validate_cloudformation",
+    description:
+      "Compile-check an AWS CloudFormation template via `aws cloudformation validate-template`. Use this in build/view stages BEFORE emitting a `<bicep>` marker (yes, the marker is named `<bicep>` even for AWS — it's the project's generic 'IaC body' marker, see system prompt) so the user only sees a template that ARM/CFN actually accepts. Catches syntax errors, malformed resource type names, missing required properties, intrinsic-function misuse. Does NOT contact AWS for live state. Multi-file is supported via `files` + `entry`. Returns the validate output verbatim.",
+    input_schema: {
+      type: "object",
+      properties: {
+        template: {
+          type: "string",
+          description:
+            "Single-file CloudFormation template (YAML or JSON). Mutually exclusive with `files`.",
+        },
+        files: {
+          type: "object",
+          description:
+            "Multi-file form: { '<filename>.(yaml|json)': '<content>', ... }. Use when your design uses nested stacks (TemplateURL: ./nested.yaml) — pass every referenced file. Filenames must be plain (no slashes, no '..').",
+          additionalProperties: { type: "string" },
+        },
+        entry: {
+          type: "string",
+          description:
+            "Filename in `files` to validate as the entry point. Defaults to `main.yaml`. Ignored when `template` is used.",
+        },
+      },
+    },
+  },
+  {
+    name: "deploy_cloudformation",
+    description:
+      "Deploy a CloudFormation stack to AWS. Spawns the official `amazon/aws-cli` container, picks up the host's SSO credentials from the mounted ~/.aws, runs `aws cloudformation deploy`, then enforces `required_tags` via stack-level tagging. Use scope='create' for a fresh stack (will fail if a stack with that name already exists), scope='update' to apply changes to an existing stack. Multi-file templates supported via `files` + `entry` for nested stacks. Region defaults from AWS_DEFAULT_REGION env, override per call via `region`.",
+    input_schema: {
+      type: "object",
+      properties: {
+        template: {
+          type: "string",
+          description:
+            "Single-file CloudFormation template (YAML or JSON). Mutually exclusive with `files`.",
+        },
+        files: {
+          type: "object",
+          description:
+            "Multi-file form for nested stacks: { '<filename>': '<content>', ... }. The entry-point file refers to siblings via `TemplateURL: ./<name>` style paths.",
+          additionalProperties: { type: "string" },
+        },
+        entry: {
+          type: "string",
+          description:
+            "Filename in `files` to deploy as the entry. Defaults to `main.yaml`.",
+        },
+        stack_name: {
+          type: "string",
+          description:
+            "Name for the CloudFormation stack. Required. Use kebab-case alphanumeric to match the project naming convention (e.g. `mcp-vigil-vpc`).",
+        },
+        region: {
+          type: "string",
+          description:
+            "AWS region (e.g. 'us-east-1', 'eu-west-2'). Defaults to AWS_DEFAULT_REGION.",
+        },
+        capabilities: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: ["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"],
+          },
+          description:
+            "CloudFormation capabilities to acknowledge — required when the template creates IAM resources (CAPABILITY_IAM, or CAPABILITY_NAMED_IAM if you set explicit role/user names) or uses transforms like SAM (CAPABILITY_AUTO_EXPAND). Pass exactly the ones the template needs.",
+        },
+        required_tags: {
+          type: "object",
+          description:
+            "Tags applied to the stack itself (and propagated to taggable resources via CloudFormation's stack tags). Mirrors Azure's required_tags — pass `mcp-project`, `mcp-topology-id`, etc. so the destroy-by-tag flow can find them later.",
+          additionalProperties: { type: "string" },
+        },
+      },
+      required: ["stack_name"],
+    },
+  },
+  {
+    name: "destroy_aws",
+    description:
+      "Delete AWS resources — by stack name, by tag filter, or both. Spawns the aws-cli sidecar with the host's SSO creds. Two modes: (1) `stack_name` deletes a specific CloudFormation stack via `aws cloudformation delete-stack` and waits for stack-delete-complete; (2) `tag_filters` finds every CloudFormation stack whose tags match ALL the listed pairs (typical: `{ mcp-project: '<name>', mcp-topology-id: '<uuid>' }`) and deletes each. Modes can be combined.",
+    input_schema: {
+      type: "object",
+      properties: {
+        stack_name: {
+          type: "string",
+          description: "Specific stack to delete. Optional.",
+        },
+        tag_filters: {
+          type: "object",
+          description:
+            "Tag key→value pairs. Stacks with ALL of these tags are deleted.",
+          additionalProperties: { type: "string" },
+        },
+        region: {
+          type: "string",
+          description:
+            "AWS region. Defaults to AWS_DEFAULT_REGION.",
+        },
+      },
+    },
+  },
 ];
 
 const CUSTOM_TOOL_NAMES = new Set(CUSTOM_TOOLS.map((t) => t.name));
@@ -184,6 +322,15 @@ export async function callCustomTool(
     return runListVmSkus(
       input as { family?: string; free_tier_only?: boolean }
     );
+  }
+  if (name === "validate_cloudformation") {
+    return runValidateCloudFormation(input as CfnSource);
+  }
+  if (name === "deploy_cloudformation") {
+    return runDeployCloudFormation(input as DeployCfnInput);
+  }
+  if (name === "destroy_aws") {
+    return runDestroyAws(input as DestroyAwsInput);
   }
   return {
     content: `unknown custom tool: ${name}`,
@@ -727,6 +874,480 @@ async function runBicepDeploy(input: DeployBicepInput): Promise<{
       }
     }
   }
+}
+
+// ── AWS / CloudFormation handlers ─────────────────────────────────
+//
+// Mirrors the Bicep trio: planBicepWrite → materialisePlan →
+// spawnAndCapture(docker run aws-cli) → cleanup. The shared
+// helpers (planBicepWrite, materialisePlan, spawnAndCapture) are
+// generic over filename — they don't care that the templates
+// happen to be YAML/JSON instead of Bicep. We just pass a
+// different FILENAME_RE-equivalent for CFN, matching .yaml/.yml/.json.
+
+const CFN_FILENAME_RE = /^[a-zA-Z0-9_.-]+\.(yaml|yml|json)$/i;
+
+type CfnSource = {
+  template?: string;
+  files?: Record<string, string>;
+  entry?: string;
+};
+
+type CfnPlan = {
+  sessionDir: string;
+  toWrite: Map<string, string>;
+  entryPath: string;
+};
+
+function planCfnWrite(
+  src: CfnSource,
+  kind: "validate" | "deploy"
+): { plan: CfnPlan } | { error: string } {
+  const session = `cfn-${kind}-${randomUUID().slice(0, 8)}`;
+  if (src.template && !src.files) {
+    if (typeof src.template !== "string" || src.template.trim().length === 0) {
+      return { error: "`template` must be a non-empty string" };
+    }
+    // Sniff the format from the first non-blank char so we name the
+    // file with the right extension. CFN-cli is happy with either.
+    const trimmed = src.template.trimStart();
+    const ext = trimmed.startsWith("{") ? "json" : "yaml";
+    const file = `${session}.${ext}`;
+    return {
+      plan: {
+        sessionDir: session,
+        toWrite: new Map([[file, src.template]]),
+        entryPath: file,
+      },
+    };
+  }
+  if (src.files) {
+    const names = Object.keys(src.files);
+    if (names.length === 0) return { error: "`files` must contain at least one entry" };
+    for (const name of names) {
+      if (!CFN_FILENAME_RE.test(name)) {
+        return {
+          error: `invalid filename in \`files\`: '${name}'. Must match plain-name + .yaml/.yml/.json`,
+        };
+      }
+      if (typeof src.files[name] !== "string") {
+        return { error: `\`files['${name}']\` must be a string` };
+      }
+    }
+    const entry = src.entry ?? "main.yaml";
+    if (!CFN_FILENAME_RE.test(entry)) {
+      return { error: `invalid \`entry\`: '${entry}'` };
+    }
+    if (!names.includes(entry)) {
+      return {
+        error: `\`entry\`='${entry}' but it is not present in \`files\`.`,
+      };
+    }
+    const toWrite = new Map<string, string>();
+    for (const name of names) toWrite.set(`${session}/${name}`, src.files[name]!);
+    return {
+      plan: {
+        sessionDir: session,
+        toWrite,
+        entryPath: `${session}/${entry}`,
+      },
+    };
+  }
+  return {
+    error: "either `template` (single-file string) or `files` (object map) is required",
+  };
+}
+
+/** Common docker args for spawning an aws-cli sidecar with the
+ *  user's credentials and the deploy workspace.
+ *
+ *  Auth precedence (matches the AWS SDK default chain):
+ *    1. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY env vars (long-
+ *       lived IAM access keys — primary path for our homelab tool,
+ *       same shape as the Azure SP).
+ *    2. Mounted ~/.aws (SSO session) — fallback for users running
+ *       `aws sso login` on the host. */
+function awsCliDockerArgs(extraEnv: Record<string, string> = {}): string[] {
+  const args = [
+    "run",
+    "--rm",
+    "-v",
+    `${WORKSPACE_VOLUME}:/work`,
+  ];
+  // Pass IAM access keys when configured. These take precedence
+  // over any ~/.aws mount because they're more deterministic
+  // (no SSO refresh window, no profile lookup).
+  if (AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY) {
+    args.push("-e", `AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}`);
+    args.push("-e", `AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`);
+    if (AWS_SESSION_TOKEN) {
+      args.push("-e", `AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}`);
+    }
+  } else if (AWS_HOST_CONFIG_PATH) {
+    // SSO fallback: mount the host's ~/.aws into the sidecar.
+    args.push("-v", `${AWS_HOST_CONFIG_PATH}:/root/.aws:ro`);
+  }
+  // If neither auth path is set, the sidecar runs unauthenticated
+  // and any CFN call fails with "Unable to locate credentials" —
+  // we surface that error verbatim rather than guess.
+  for (const [k, v] of Object.entries(extraEnv)) {
+    if (v !== undefined && v !== "") args.push("-e", `${k}=${v}`);
+  }
+  args.push(AWS_CLI_IMAGE);
+  return args;
+}
+
+async function runValidateCloudFormation(input: CfnSource): Promise<{
+  content: string;
+  is_error: boolean;
+}> {
+  const planned = planCfnWrite(input, "validate");
+  if ("error" in planned) {
+    return { content: planned.error, is_error: true };
+  }
+  // We don't strictly need ~/.aws to validate, but aws-cli sometimes
+  // 400s on validate-template if the region resolver can't find a
+  // home — passing AWS_DEFAULT_REGION sidesteps that.
+  const cleanupPaths: string[] = [];
+  const isMulti = [...planned.plan.toWrite.keys()][0]?.includes("/") ?? false;
+  if (isMulti) {
+    await import("node:fs/promises").then((fs) =>
+      fs.mkdir(join(WORKSPACE, planned.plan.sessionDir), { recursive: true })
+    );
+  }
+  for (const [rel, content] of planned.plan.toWrite) {
+    const abs = join(WORKSPACE, rel);
+    await writeFile(abs, content, "utf8");
+    cleanupPaths.push(abs);
+  }
+  const entryWorkPath = `/work/${planned.plan.entryPath}`;
+
+  try {
+    const dockerArgs = [
+      ...awsCliDockerArgs({
+        AWS_DEFAULT_REGION,
+        AWS_PROFILE,
+      }),
+      "cloudformation",
+      "validate-template",
+      "--template-body",
+      `file://${entryWorkPath}`,
+    ];
+    const result = await spawnAndCapture("docker", dockerArgs, {
+      timeoutMs: 90_000,
+    });
+    const ok = result.code === 0;
+    const summary = ok
+      ? `# validate_cloudformation — OK\n\nTemplate is well-formed. Safe to emit the \`<bicep>\` marker.`
+      : [
+          `# validate_cloudformation — FAILED (exit ${result.code})`,
+          ``,
+          `## errors`,
+          "```",
+          (result.stderr.trim() || result.stdout.trim()).slice(-3000),
+          "```",
+          ``,
+          `Fix these issues, then call \`validate_cloudformation\` again before emitting the \`<bicep>\` marker.`,
+        ].join("\n");
+    return { content: summary, is_error: !ok };
+  } finally {
+    await cleanupPlanFiles(cleanupPaths);
+  }
+}
+
+type DeployCfnInput = CfnSource & {
+  stack_name: string;
+  region?: string;
+  capabilities?: string[];
+  required_tags?: Record<string, string>;
+};
+
+async function runDeployCloudFormation(input: DeployCfnInput): Promise<{
+  content: string;
+  is_error: boolean;
+}> {
+  if (!AWS_AUTH_CONFIGURED) {
+    return {
+      content:
+        "# deploy_cloudformation — AWS not configured\n\n" +
+        "Set EITHER `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (long-lived IAM keys, recommended for homelab) " +
+        "OR `AWS_HOST_CONFIG_PATH` (path to host's `~/.aws` for SSO sessions) in the backend's `.env`, then restart the backend.",
+      is_error: true,
+    };
+  }
+  if (!input.stack_name || !/^[a-zA-Z][a-zA-Z0-9-]{0,127}$/.test(input.stack_name)) {
+    return {
+      content:
+        "`stack_name` is required and must be 1–128 chars: letter, then alphanumerics + dashes (CloudFormation rules).",
+      is_error: true,
+    };
+  }
+  // Pre-flight validate so we never attempt a CFN deploy on a
+  // template that won't parse — same defence-in-depth as Bicep.
+  const preValidate = await runValidateCloudFormation({
+    template: input.template,
+    files: input.files,
+    entry: input.entry,
+  });
+  if (preValidate.is_error) {
+    return {
+      content:
+        "# deploy_cloudformation — pre-flight validation FAILED\n\n" +
+        preValidate.content,
+      is_error: true,
+    };
+  }
+
+  const planned = planCfnWrite(
+    { template: input.template, files: input.files, entry: input.entry },
+    "deploy"
+  );
+  if ("error" in planned) {
+    return { content: planned.error, is_error: true };
+  }
+  const plan = planned.plan;
+  const isMulti = [...plan.toWrite.keys()][0]?.includes("/") ?? false;
+  if (isMulti) {
+    await import("node:fs/promises").then((fs) =>
+      fs.mkdir(join(WORKSPACE, plan.sessionDir), { recursive: true })
+    );
+  }
+  const cleanupPaths: string[] = [];
+  for (const [rel, content] of plan.toWrite) {
+    const abs = join(WORKSPACE, rel);
+    await writeFile(abs, content, "utf8");
+    cleanupPaths.push(abs);
+  }
+  const entryWorkPath = `/work/${plan.entryPath}`;
+  const region = input.region ?? AWS_DEFAULT_REGION;
+
+  try {
+    // `aws cloudformation deploy` is the high-level wrapper that
+    // creates-or-updates as appropriate, waits for the change set
+    // to settle, and exits non-zero on failure. Cleaner than
+    // create-stack + wait-for-stack-create-complete.
+    const tagPairs = Object.entries(input.required_tags ?? {}).filter(
+      ([k, v]) => k && v
+    );
+    const args = [
+      "cloudformation",
+      "deploy",
+      "--stack-name",
+      input.stack_name,
+      "--template-file",
+      entryWorkPath,
+      "--region",
+      region,
+      "--no-fail-on-empty-changeset",
+    ];
+    if (input.capabilities && input.capabilities.length > 0) {
+      args.push("--capabilities", ...input.capabilities);
+    }
+    if (tagPairs.length > 0) {
+      args.push("--tags", ...tagPairs.map(([k, v]) => `${k}=${v}`));
+    }
+
+    const dockerArgs = [
+      ...awsCliDockerArgs({ AWS_DEFAULT_REGION: region, AWS_PROFILE }),
+      ...args,
+    ];
+
+    const result = await spawnAndCapture("docker", dockerArgs, {
+      timeoutMs: 30 * 60 * 1000,
+    });
+    const summary = [
+      `# aws cloudformation deploy — ${input.stack_name}`,
+      ``,
+      `**exit code:** ${result.code}`,
+      ``,
+      `## stdout`,
+      "```",
+      result.stdout.slice(0, 8000),
+      "```",
+      result.stderr.trim().length > 0
+        ? `## stderr\n\n\`\`\`\n${result.stderr.slice(0, 4000)}\n\`\`\``
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return { content: summary, is_error: result.code !== 0 };
+  } finally {
+    await cleanupPlanFiles(cleanupPaths);
+    if (plan.entryPath.includes("/")) {
+      try {
+        await import("node:fs/promises").then((fs) =>
+          fs.rmdir(join(WORKSPACE, plan.sessionDir))
+        );
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+type DestroyAwsInput = {
+  stack_name?: string;
+  tag_filters?: Record<string, string>;
+  region?: string;
+};
+
+async function runDestroyAws(input: DestroyAwsInput): Promise<{
+  content: string;
+  is_error: boolean;
+}> {
+  if (!AWS_AUTH_CONFIGURED) {
+    return {
+      content:
+        "destroy_aws — AWS auth not configured. Set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (or AWS_HOST_CONFIG_PATH) in the backend's .env.",
+      is_error: true,
+    };
+  }
+  const stack = input.stack_name?.trim();
+  const tags = input.tag_filters ?? {};
+  const tagEntries = Object.entries(tags).filter(([k, v]) => k && v);
+  if (!stack && tagEntries.length === 0) {
+    return {
+      content:
+        "destroy_aws requires either `stack_name` or non-empty `tag_filters`",
+      is_error: true,
+    };
+  }
+
+  const region = input.region ?? AWS_DEFAULT_REGION;
+  const lines: string[] = [
+    `set -e`,
+    `echo "## destroy_aws plan"`,
+    stack ? `echo "specific stack: ${stack}"` : "",
+    tagEntries.length > 0
+      ? `echo "tag filters: ${tagEntries.map(([k, v]) => `${k}=${v}`).join(", ")}"`
+      : "",
+  ];
+
+  if (tagEntries.length > 0) {
+    // Find every CFN stack whose tags include EVERY filter pair.
+    // describe-stacks JMES filters: each tag is { Key, Value }, so
+    // we need an `[? ... && ...]` expression that ANDs them.
+    const conds = tagEntries
+      .map(([k, v]) => `Tags[?Key=='${k}' && Value=='${v}']`)
+      .join(" && ");
+    lines.push(
+      `echo ""`,
+      `echo "## matching stacks"`,
+      // CFN active stacks only (skip already-deleted ones via filter).
+      `STACKS=$(aws cloudformation describe-stacks --region "${region}" --query "Stacks[?${conds}].StackName" --output text 2>/dev/null || echo "")`,
+      `if [ -z "$STACKS" ]; then echo "(none)"; else echo "$STACKS"; fi`,
+      `for S in $STACKS; do`,
+      `  echo "deleting stack: $S"`,
+      `  aws cloudformation delete-stack --region "${region}" --stack-name "$S" || true`,
+      `done`
+    );
+  }
+  if (stack) {
+    lines.push(
+      `echo ""`,
+      `echo "## explicit stack delete: ${stack}"`,
+      `aws cloudformation delete-stack --region "${region}" --stack-name "${stack}" || true`
+    );
+  }
+
+  // Wait for deletions to complete.
+  if (tagEntries.length > 0) {
+    const conds = tagEntries
+      .map(([k, v]) => `Tags[?Key=='${k}' && Value=='${v}']`)
+      .join(" && ");
+    lines.push(
+      `echo ""`,
+      `echo "## waiting for stack deletions to complete"`,
+      `for i in $(seq 1 60); do`,
+      `  REMAINING=$(aws cloudformation describe-stacks --region "${region}" --query "Stacks[?${conds}].StackName" --output text 2>/dev/null || echo "")`,
+      `  if [ -z "$REMAINING" ]; then echo "all matching stacks gone"; break; fi`,
+      `  echo "still pending: $REMAINING"; sleep 10`,
+      `done`
+    );
+  }
+  if (stack) {
+    lines.push(
+      `echo ""`,
+      `echo "## waiting for ${stack} to be gone"`,
+      `for i in $(seq 1 60); do`,
+      `  if ! aws cloudformation describe-stacks --region "${region}" --stack-name "${stack}" >/dev/null 2>&1; then echo "${stack} gone"; break; fi`,
+      `  sleep 10`,
+      `done`
+    );
+  }
+
+  const shellScript = lines.filter(Boolean).join("\n");
+  const dockerArgs = [
+    ...awsCliDockerArgs({ AWS_DEFAULT_REGION: region, AWS_PROFILE }),
+    "--",
+    "sh",
+    "-c",
+    shellScript,
+  ];
+  // The aws-cli image's ENTRYPOINT is `aws`. To run a shell we need
+  // `--entrypoint /bin/sh` (or use the `aws` ENTRYPOINT for single
+  // commands). Override entrypoint here so we can run a shell script.
+  // We rebuild the args list because awsCliDockerArgs already
+  // appended the IMAGE — splice an --entrypoint right before it.
+  const imgIdx = dockerArgs.indexOf(AWS_CLI_IMAGE);
+  if (imgIdx >= 0) {
+    dockerArgs.splice(imgIdx, 0, "--entrypoint", "/bin/sh");
+  }
+  // Now the `--` and `sh -c` we pushed at the end conflict with the
+  // overridden entrypoint. Drop the literal "--" and "sh" tokens
+  // we appended; the entrypoint /bin/sh will be invoked directly
+  // with `-c <script>` as its arg.
+  // Rebuild cleanly to avoid bugs. Auth precedence matches the rest
+  // of the AWS path: access keys first, fall back to ~/.aws mount.
+  const useAccessKeys =
+    Boolean(AWS_ACCESS_KEY_ID) && Boolean(AWS_SECRET_ACCESS_KEY);
+  const finalArgs = [
+    "run",
+    "--rm",
+    "-v",
+    `${WORKSPACE_VOLUME}:/work`,
+    ...(useAccessKeys
+      ? [
+          "-e",
+          `AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}`,
+          "-e",
+          `AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`,
+          ...(AWS_SESSION_TOKEN
+            ? ["-e", `AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}`]
+            : []),
+        ]
+      : AWS_HOST_CONFIG_PATH
+        ? ["-v", `${AWS_HOST_CONFIG_PATH}:/root/.aws:ro`]
+        : []),
+    "-e",
+    `AWS_DEFAULT_REGION=${region}`,
+    ...(!useAccessKeys && AWS_PROFILE
+      ? ["-e", `AWS_PROFILE=${AWS_PROFILE}`]
+      : []),
+    "--entrypoint",
+    "/bin/sh",
+    AWS_CLI_IMAGE,
+    "-c",
+    shellScript,
+  ];
+
+  const result = await spawnAndCapture("docker", finalArgs, {
+    timeoutMs: 30 * 60 * 1000,
+  });
+  const summary = [
+    `# destroy_aws — exit ${result.code}`,
+    ``,
+    `## stdout`,
+    "```",
+    result.stdout.slice(0, 8000),
+    "```",
+    result.stderr.trim().length > 0
+      ? `## stderr\n\n\`\`\`\n${result.stderr.slice(0, 4000)}\n\`\`\``
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return { content: summary, is_error: result.code !== 0 };
 }
 
 function spawnAndCapture(

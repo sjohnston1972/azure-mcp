@@ -60,11 +60,18 @@ export type AssistantBlock =
       resultPreview?: string;
     };
 
+/** Which cloud a project (and its topologies) target. Set at create
+ *  time; can't change because the project name becomes a tag on
+ *  resources in that cloud. The header toggle filters projects by
+ *  this field. */
+export type Cloud = "azure" | "aws";
+
 // Project shape from the backend.
 export type Project = {
   id: string;
   name: string;
   description: string | null;
+  cloud: Cloud;
   github_repo: string | null;
   github_synced_at: string | null;
   created_at: string;
@@ -137,6 +144,7 @@ export type TopologyRecord = {
   project_id: string;
   name: string;
   status: TopologyStatus;
+  cloud: Cloud;
   topology: import("./parse-topology").Topology | null;
   bicep: string | null;
   pushed_at: string | null;

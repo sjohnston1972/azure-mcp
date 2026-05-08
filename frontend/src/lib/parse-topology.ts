@@ -2,12 +2,14 @@
 // graph. Returns null if no marker is present, or if the JSON is
 // malformed (we silently fall back rather than blow up the chat).
 
-import type { AzureNodeStatus, AzureResourceKind } from "./azure-icons";
+import type { AzureNodeStatus, CloudResourceKind } from "./azure-icons";
 
 export type TopologyNode = {
   id: string;
   label: string;
-  kind: AzureResourceKind;
+  // Multi-cloud: this used to be AzureResourceKind. Now it's the
+  // broader union so AWS designs render too.
+  kind: CloudResourceKind;
   sublabel?: string;
   status: AzureNodeStatus;
 };

@@ -21,7 +21,11 @@
 import type { FastifyInstance } from "fastify";
 import type Anthropic from "@anthropic-ai/sdk";
 import { anthropic } from "../claude/client.js";
-import { SYSTEM_PROMPT } from "../claude/system-prompt.js";
+import {
+  SYSTEM_PROMPT,
+  systemPromptFor,
+  type Cloud,
+} from "../claude/system-prompt.js";
 import { callMcpTool, getClaudeTools } from "../claude/tool-bridge.js";
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
@@ -160,9 +164,28 @@ export async function chatRoutes(app: FastifyInstance) {
     // Local mutable copy of the conversation; we append assistant turns
     // and tool-result user turns as the agentic loop progresses.
     const messages: Anthropic.MessageParam[] = [...body.messages];
+
+    // Look up project's cloud first so we can pick BOTH the right
+    // system prompt AND the right MCP tool set. Each cloud has its
+    // own frozen prompt + cached tool list — they're independent,
+    // so flipping clouds in the toggle doesn't pollute the other
+    // cloud's prompt cache. Default to azure when no project.
+    let projectCloud: Cloud = "azure";
+    if (body.project_id) {
+      try {
+        const { rows } = await pool.query<{ cloud: Cloud }>(
+          "SELECT cloud FROM projects WHERE id = $1",
+          [body.project_id]
+        );
+        if (rows[0]?.cloud) projectCloud = rows[0].cloud;
+      } catch {
+        // ignore — fall back to azure default
+      }
+    }
+
     let tools: Anthropic.Tool[];
     try {
-      tools = await getClaudeTools();
+      tools = await getClaudeTools(projectCloud);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       sse("error", { message: `failed to load MCP tools: ${message}` });
@@ -178,7 +201,7 @@ export async function chatRoutes(app: FastifyInstance) {
     const systemBlocks: Anthropic.TextBlockParam[] = [
       {
         type: "text",
-        text: SYSTEM_PROMPT,
+        text: systemPromptFor(projectCloud),
         cache_control: { type: "ephemeral" },
       },
     ];

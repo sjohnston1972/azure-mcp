@@ -5,13 +5,15 @@ import {
   ICON_FOR,
   TONE_FOR,
   type AzureNodeStatus,
-  type AzureResourceKind,
+  type CloudResourceKind,
 } from "../../lib/azure-icons";
 
 export type AzureNodeData = {
   label: string;
   sublabel?: string;
-  kind: AzureResourceKind;
+  // Now multi-cloud — accepts any kind from the unified
+  // Azure + AWS resource enum.
+  kind: CloudResourceKind;
   status: AzureNodeStatus;
 };
 

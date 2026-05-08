@@ -67,6 +67,17 @@ services:
       # even if the user hasn't configured this — backend then falls
       # back to the GH_TOKEN env var (also optional).
       - "${GH_CONFIG_DIR:-./gh-config}:/gh-config:ro"
+      # Optional: mount the host's ~/.aws so the AWS deploy tools
+      # (CloudFormation deploy/validate/destroy) can reuse the
+      # existing SSO session. Set AWS_HOST_CONFIG_PATH in .env to:
+      #   Linux/Mac:  $HOME/.aws
+      #   Windows:    C:/Users/<you>/.aws
+      # Run `aws sso login` on the host first. The same path also
+      # gets passed to the aws-cli sidecar at -v <path>:/root/.aws:ro
+      # at deploy time (the docker daemon resolves <path> on the
+      # HOST, not inside this container — so we need the host path
+      # explicitly, not the in-container mount path).
+      - "${AWS_HOST_CONFIG_PATH:-./aws-config}:/aws-config:ro"
     depends_on:
       azure-mcp-db:
         condition: service_healthy
@@ -93,6 +104,20 @@ services:
     profiles: ["_build_only_"]
     # No-op command — this service exists to get the image built by
     # `docker compose build`. Backend never starts this directly.
+    command: ["true"]
+
+  # ── AWS Labs aws-api-mcp-server ────────────────────────────────────
+  # Read-mostly access to the AWS API surface. Spawned on demand by
+  # the backend (see backend/src/mcp/aws-client.ts) when the active
+  # project's cloud is 'aws'. Auth via the host's mounted ~/.aws.
+  # Same _build_only_ trick as bicep-mcp — image built but never
+  # started as a long-lived service.
+  aws-mcp:
+    build:
+      context: ./aws-mcp
+      dockerfile: Dockerfile
+    image: azure-mcp-aws-mcp:latest
+    profiles: ["_build_only_"]
     command: ["true"]
 
   # ── Postgres (projects, deployments, templates) ────────────────────

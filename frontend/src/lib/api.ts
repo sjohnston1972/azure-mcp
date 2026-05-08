@@ -3,6 +3,7 @@
 
 import type {
   ChatMessage,
+  Cloud,
   GithubPushResult,
   GithubStatus,
   Project,
@@ -39,15 +40,20 @@ export async function streamChat(
   return res;
 }
 
-export async function listProjects(): Promise<Project[]> {
-  const res = await fetch("/api/projects");
-  if (!res.ok) throw new Error(`/api/projects → ${res.status}`);
+/** List projects, optionally filtered by cloud. The header toggle
+ *  drives this — the project dropdown only shows projects matching
+ *  the active cloud. */
+export async function listProjects(cloud?: Cloud): Promise<Project[]> {
+  const url = cloud ? `/api/projects?cloud=${cloud}` : "/api/projects";
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} → ${res.status}`);
   return res.json();
 }
 
 export async function createProject(input: {
   name: string;
   description?: string;
+  cloud?: Cloud;
 }): Promise<Project> {
   const res = await fetch("/api/projects", {
     method: "POST",

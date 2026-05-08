@@ -37,6 +37,7 @@ import {
 import { captureCanvasPng } from "./lib/canvas-screenshot";
 import type {
   BuildState,
+  Cloud,
   GithubStatus,
   Project,
   Template,
@@ -90,20 +91,41 @@ function AppInner() {
   const [githubStatus, setGithubStatus] = useState<GithubStatus | null>(null);
   const [vmSelectorOpen, setVmSelectorOpen] = useState(false);
 
+  // Active cloud — drives which projects show up in the dropdown,
+  // which system prompt the chat uses, which deploy tools are
+  // available, and the visual treatment of the header. Persisted
+  // to localStorage so a refresh keeps the user's last toggle.
+  const [cloud, setCloud] = useState<Cloud>(() => {
+    const saved = localStorage.getItem("azure-mcp:cloud");
+    return saved === "aws" ? "aws" : "azure";
+  });
+  useEffect(() => {
+    localStorage.setItem("azure-mcp:cloud", cloud);
+    // Drive the AWS-orange palette swap defined in index.css.
+    // Setting data-cloud on <html> lets the [data-cloud="aws"]
+    // selector flip --color-primary etc. without us writing
+    // colour overrides in every component.
+    document.documentElement.setAttribute("data-cloud", cloud);
+  }, [cloud]);
+
   // ── Project bootstrap + selection ────────────────────────────
+  // Only fetches projects matching the active cloud. The
+  // active-project memory is per-cloud (separate localStorage key)
+  // so flipping the toggle restores YOUR last choice in that cloud
+  // rather than landing on a stale project from the other cloud.
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const list = await listProjects();
+      const list = await listProjects(cloud);
       setProjects(list);
-      const savedId = localStorage.getItem(ACTIVE_PROJECT_KEY);
+      const savedId = localStorage.getItem(`${ACTIVE_PROJECT_KEY}:${cloud}`);
       const restored = savedId ? list.find((p) => p.id === savedId) : null;
       const next = restored ?? list[0] ?? null;
       setCurrent(next);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [cloud]);
 
   useEffect(() => {
     void refresh();
@@ -168,16 +190,21 @@ function AppInner() {
 
   const select = useCallback((p: Project) => {
     setCurrent(p);
-    localStorage.setItem(ACTIVE_PROJECT_KEY, p.id);
+    // Per-cloud key so each cloud remembers the last project the
+    // user worked on independently.
+    localStorage.setItem(`${ACTIVE_PROJECT_KEY}:${p.cloud}`, p.id);
   }, []);
 
   const create = useCallback(
     async (input: { name: string; description?: string }) => {
-      const created = await createProject(input);
+      // Stamp the new project with whichever cloud is currently
+      // active in the toggle. NewProjectModal doesn't ask the user
+      // to pick a cloud — the toggle IS the cloud picker.
+      const created = await createProject({ ...input, cloud });
       setProjects((cur) => [created, ...cur]);
       select(created);
     },
-    [select]
+    [select, cloud]
   );
 
   const removeProject = useCallback(
@@ -428,16 +455,20 @@ function AppInner() {
   const handleDeleteTopology = useCallback(
     async (t: TopologyRecord) => {
       const live = t.status === "live";
+      // Cloud-aware text: each topology row remembers its own cloud
+      // (denormalised on the row), so a delete confirm always names
+      // the right provider regardless of the toggle's current state.
+      const cloudName = t.cloud === "aws" ? "AWS" : "Azure";
       const ok = await confirm({
         title: `Delete topology '${t.name}'?`,
         message: live ? (
           <>
-            This removes the topology record from azure-mcp.{" "}
-            <strong>The Azure resources stay alive</strong> — destroy
+            This removes the topology record from Cloud Topology Creator.{" "}
+            <strong>The {cloudName} resources stay alive</strong> — destroy
             the topology first if you want them removed too.
           </>
         ) : (
-          <>This removes the topology record. No Azure side effects.</>
+          <>This removes the topology record. No {cloudName} side effects.</>
         ),
         confirmLabel: "Delete",
         tone: "danger",
@@ -633,24 +664,60 @@ function AppInner() {
   return (
     <div className="h-screen flex flex-col">
       <header className="h-16 shrink-0 sticky top-0 z-40 bg-surface-container-lowest border-b border-outline-variant/40 flex items-center px-6 gap-4">
-        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-primary to-primary-container grid place-items-center text-on-primary text-sm font-extrabold">
-          a
+        {/* Cloud-icon badge. The icon itself stays the same across
+            modes (cloud is the umbrella concept); the badge BG is
+            the active primary, which our index.css [data-cloud=aws]
+            selector swaps to AWS orange. */}
+        <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-primary to-primary-container grid place-items-center text-on-primary shadow-sm">
+          <span className="material-symbols-outlined text-[22px]">cloud</span>
         </div>
-        <h1 className="text-lg font-extrabold tracking-tight">azure-mcp</h1>
+        <h1 className="text-lg font-extrabold tracking-tight">
+          Cloud Topology Creator
+        </h1>
         <span className="text-xs text-on-surface-variant ml-2 hidden md:inline">
-          azure architecture, designed in chat
+          {cloud === "aws"
+            ? "AWS architecture, designed in chat"
+            : "Azure architecture, designed in chat"}
         </span>
 
+        {/* Cloud toggle — switches the whole UI between Azure and
+            AWS modes. Project list, system prompt, deploy tools,
+            and visual treatment all key off this. localStorage
+            persists the choice across reloads. */}
+        <div className="ml-4 inline-flex items-center rounded-lg border border-outline-variant/40 bg-surface-container-low p-0.5">
+          {(["azure", "aws"] as const).map((c) => (
+            <button
+              key={c}
+              type="button"
+              onClick={() => setCloud(c)}
+              className={`px-3 py-1 rounded-md text-xs font-bold uppercase tracking-wide transition-colors ${
+                cloud === c
+                  ? "bg-primary text-on-primary shadow-sm"
+                  : "text-on-surface-variant hover:text-on-surface"
+              }`}
+              title={
+                c === "azure"
+                  ? "Azure mode — Bicep, az CLI, Microsoft Azure MCP"
+                  : "AWS mode — CloudFormation, aws CLI (SSO from host)"
+              }
+            >
+              {c === "azure" ? "Azure" : "AWS"}
+            </button>
+          ))}
+        </div>
+
         <div className="ml-auto flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setVmSelectorOpen(true)}
-            title="Browse Azure VM sizes (free-tier highlighted)"
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-outline-variant/40 hover:bg-surface-container-high transition-colors text-sm font-semibold text-on-surface-variant"
-          >
-            <span className="material-symbols-outlined text-base">memory</span>
-            VM sizes
-          </button>
+          {cloud === "azure" && (
+            <button
+              type="button"
+              onClick={() => setVmSelectorOpen(true)}
+              title="Browse Azure VM sizes (free-tier highlighted)"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-outline-variant/40 hover:bg-surface-container-high transition-colors text-sm font-semibold text-on-surface-variant"
+            >
+              <span className="material-symbols-outlined text-base">memory</span>
+              VM sizes
+            </button>
+          )}
           <ProjectSwitcher
             projects={projects}
             current={current}
@@ -688,11 +755,12 @@ function AppInner() {
           onLoadTemplate={(t) => void handleLoadTemplate(t)}
           onDeleteTemplate={(t) => void handleDeleteTemplate(t)}
           onDestroyTopology={async (t) => {
+            const cloudName = t.cloud === "aws" ? "AWS" : "Azure";
             const ok = await confirm({
               title: `Destroy topology '${t.name}'?`,
               message: (
                 <>
-                  This deletes every Azure resource tagged with{" "}
+                  This deletes every {cloudName} resource tagged with{" "}
                   <code className="font-mono text-[12px] px-1 py-0.5 rounded bg-surface-container-high">
                     mcp-topology-id={t.id.slice(0, 8)}…
                   </code>
@@ -727,6 +795,7 @@ function AppInner() {
           <ChatPanel
             projectName={current?.name ?? null}
             projectId={current?.id ?? null}
+            cloud={current?.cloud ?? cloud}
             activeTopologyId={activeTopologyId}
             activeTopologyName={activeTopology?.name ?? null}
             build={build}
