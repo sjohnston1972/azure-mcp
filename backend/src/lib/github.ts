@@ -122,12 +122,14 @@ export async function ensureRepo(input: {
 }
 
 /** PUT a single file. Idempotent: if the file already exists, we look
- *  up its sha and pass it as the update predicate, otherwise create. */
+ *  up its sha and pass it as the update predicate, otherwise create.
+ *  Accepts either a UTF-8 string (gets base64-encoded) or a raw Buffer
+ *  (used for binary blobs like the topology screenshot). */
 export async function putFile(input: {
   owner: string;
   repo: string;
   path: string;
-  content: string;
+  content: string | Buffer;
   message: string;
   branch?: string;
 }): Promise<void> {
@@ -142,9 +144,13 @@ export async function putFile(input: {
     sha = (head.json as { sha?: string }).sha;
   }
 
+  const base64 = Buffer.isBuffer(input.content)
+    ? input.content.toString("base64")
+    : Buffer.from(input.content, "utf8").toString("base64");
+
   const body: Record<string, unknown> = {
     message: input.message,
-    content: Buffer.from(input.content, "utf8").toString("base64"),
+    content: base64,
   };
   if (sha) body["sha"] = sha;
   if (input.branch) body["branch"] = input.branch;
@@ -163,15 +169,66 @@ export async function putFile(input: {
   }
 }
 
-/** Sanitise a project name into a valid GitHub repo name. */
-export function repoNameForProject(projectName: string): string {
-  // GitHub repo names: alphanumeric, hyphen, underscore, period.
-  // Max 100 chars. We prepend `azure-mcp-` so the user can find the
-  // family at a glance.
-  const safe = projectName
+/** Sanitise a name into a GitHub-safe slug (alnum + ._-). */
+function slug(name: string, max = 80): string {
+  return name
     .toLowerCase()
     .replace(/[^a-z0-9_.-]/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 80);
-  return `azure-mcp-${safe || "project"}`;
+    .slice(0, max);
+}
+
+/** Repo name for a project. Includes the project's UUID short suffix
+ *  so two projects with similar/identical names don't collide on
+ *  re-creation. Caller passes the project's database UUID. */
+export function repoNameForProject(
+  projectName: string,
+  projectId?: string
+): string {
+  const base = `azure-mcp-${slug(projectName) || "project"}`;
+  if (!projectId) return base;
+  // First 8 chars of the UUID — collision-safe for any sub-billion
+  // project count, keeps the name readable.
+  const suffix = projectId.replace(/-/g, "").slice(0, 8);
+  // Cap to GitHub's 100-char limit defensively.
+  return `${base}-${suffix}`.slice(0, 100);
+}
+
+/** Repo name for a topology. Same shape as project: a readable slug
+ *  followed by the topology's UUID short. */
+export function repoNameForTopology(
+  topologyName: string,
+  topologyId: string
+): string {
+  const base = `azure-mcp-${slug(topologyName) || "topology"}`;
+  const suffix = topologyId.replace(/-/g, "").slice(0, 8);
+  return `${base}-${suffix}`.slice(0, 100);
+}
+
+/** Split a multi-file `<bicep>` marker body back into its
+ *  { filename → content } map. Looks for `// === FILE: <name> ===`
+ *  separator lines. Single-file input (no separators) returns a
+ *  one-entry map keyed `main.bicep`. */
+export function splitMultiFileBicep(
+  bicep: string
+): Record<string, string> {
+  const sepRe = /^\s*\/\/\s*===\s*FILE\s*:\s*(.+?)\s*===\s*$/gm;
+  const matches: { name: string; index: number }[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = sepRe.exec(bicep)) !== null) {
+    matches.push({ name: m[1]!.trim(), index: m.index + m[0].length });
+  }
+  if (matches.length === 0) {
+    return { "main.bicep": bicep };
+  }
+  const out: Record<string, string> = {};
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i]!.index;
+    const end = i + 1 < matches.length ? matches[i + 1]!.index - 0 : bicep.length;
+    // Strip the next match's separator line itself if present (we
+    // captured `index` as the position right after the separator,
+    // so end is naturally the start of the next separator).
+    out[matches[i]!.name] = bicep.slice(start, end).replace(/^\s*\n/, "").trimEnd() + "\n";
+  }
+  return out;
 }

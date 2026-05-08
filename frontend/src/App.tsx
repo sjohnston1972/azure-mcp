@@ -32,7 +32,9 @@ import {
   listProjects,
   listTopologies,
   patchTopology,
+  pushTopologyToGithub,
 } from "./lib/api";
+import { captureCanvasPng } from "./lib/canvas-screenshot";
 import type {
   BuildState,
   GithubStatus,
@@ -230,9 +232,20 @@ function AppInner() {
   const handleLoadTemplate = useCallback(
     async (t: Template) => {
       if (!current) return;
+      // If the template carries the canvas JSON it was saved with,
+      // we can render the topology directly — no Claude round-trip.
+      // Older templates (saved before topology was captured) still
+      // fall back to asking Claude to derive a marker from the Bicep.
+      const hasCanvas = !!t.topology;
       const ok = await confirm({
         title: `Load '${t.name}' into '${current.name}'?`,
-        message: (
+        message: hasCanvas ? (
+          <>
+            Creates a new <strong>draft topology</strong> in this project
+            from the saved Bicep and canvas snapshot. Renders straight
+            from saved data — no chat call.
+          </>
+        ) : (
           <>
             Creates a new <strong>draft topology</strong> in this project
             from the saved Bicep. Claude will render the canvas on the
@@ -249,29 +262,141 @@ function AppInner() {
           project_id: current.id,
           name: t.name.slice(0, 24),
           bicep: t.bicep,
+          // Pass through the saved canvas if present so the new
+          // topology row lands with both bicep and topology JSON.
+          ...(t.topology ? { topology: t.topology } : {}),
         });
         setTopologies((cur) => [created, ...cur]);
         setActiveTopologyId(created.id);
-        // Ask Claude to populate the topology marker from the loaded
-        // Bicep so the canvas fills in. The Bicep is inlined so the
-        // model has it even if Claude's earlier conversation history
-        // doesn't contain it (e.g. brand-new chat).
-        setAutoPrompt({
-          text:
-            `I've loaded the saved template '${t.name}' as a new draft topology in '${current.name}'. ` +
-            `Render the topology canvas based on this Bicep — emit a \`<topology>\` marker only (no \`<bicep>\`, no changes). ` +
-            `Don't deploy. Here's the template:\n\n` +
-            "```bicep\n" +
-            t.bicep +
-            "\n```",
-          key: Date.now(),
-        });
+        if (!hasCanvas) {
+          // Legacy templates: fall back to the LLM rendering path so
+          // the canvas eventually fills in. The Bicep is inlined so
+          // the model has it even on a fresh chat.
+          setAutoPrompt({
+            text:
+              `I've loaded the saved template '${t.name}' as a new draft topology in '${current.name}'. ` +
+              `Render the topology canvas based on this Bicep — emit a \`<topology>\` marker only (no \`<bicep>\`, no changes). ` +
+              `Don't deploy. Here's the template:\n\n` +
+              "```bicep\n" +
+              t.bicep +
+              "\n```",
+            key: Date.now(),
+          });
+        }
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error("[load template]", err);
       }
     },
     [current, confirm]
+  );
+
+  // Tracks the topology currently being synced to GitHub so the
+  // rail row can show a spinner + disable the button. Also rate-
+  // limits to one sync at a time across the whole app.
+  const [syncingTopologyId, setSyncingTopologyId] = useState<string | null>(
+    null
+  );
+  // Tracks the topology currently being destroyed in Azure. Lets the
+  // rail row show "destroying…" with a spinner and hide the Destroy
+  // button immediately on click — without waiting for the chat turn
+  // to complete (which can take 5-10 minutes).
+  const [destroyingTopologyId, setDestroyingTopologyId] = useState<
+    string | null
+  >(null);
+
+  /** Sync a topology to its own GitHub repo (Bicep + topology.json
+   *  + README + canvas screenshot). Capture the screenshot from the
+   *  React Flow canvas after switching to that topology so the user
+   *  sees what will be saved before the upload. */
+  const handleSyncTopologyToGithub = useCallback(
+    async (t: TopologyRecord) => {
+      if (!githubStatus?.configured) return;
+      if (syncingTopologyId) return; // Already a sync in flight.
+
+      const ok = await confirm({
+        title: t.github_repo
+          ? `Re-sync '${t.name}' to GitHub?`
+          : `Sync '${t.name}' to GitHub?`,
+        message: (
+          <>
+            {t.github_repo ? (
+              <>
+                Updates the existing repo{" "}
+                <code className="font-mono text-[12px] px-1 py-0.5 rounded bg-surface-container-high">
+                  {t.github_repo}
+                </code>{" "}
+                with the latest Bicep, topology JSON, README, and a
+                fresh canvas screenshot.
+              </>
+            ) : (
+              <>
+                Creates a new private GitHub repo named{" "}
+                <code className="font-mono text-[12px] px-1 py-0.5 rounded bg-surface-container-high">
+                  azure-mcp-{t.name.toLowerCase().replace(/[^a-z0-9_.-]/g, "-")}-
+                  {t.id.replace(/-/g, "").slice(0, 8)}
+                </code>{" "}
+                with the Bicep, topology JSON, README, and a canvas
+                screenshot.
+              </>
+            )}
+          </>
+        ),
+        confirmLabel: t.github_repo ? "Re-sync" : "Sync to GitHub",
+        icon: "cloud_upload",
+        tone: "primary",
+      });
+      if (!ok) return;
+
+      // Switch to the target topology if needed so the canvas is
+      // showing the right thing. Then ALWAYS wait a short settle
+      // window before capturing — React Flow can be mid-layout (or
+      // remount) even when the topology was already active, and a
+      // half-rendered screenshot has bitten us before. Two animation
+      // frames + a 250ms tick gives the layout pass time to land.
+      if (activeTopologyId !== t.id) {
+        setActiveTopologyId(t.id);
+      }
+      await new Promise((r) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => r(null)))
+      );
+      await new Promise((r) => setTimeout(r, 250));
+
+      setSyncingTopologyId(t.id);
+      try {
+        let screenshot: string | undefined;
+        try {
+          const png = await captureCanvasPng();
+          screenshot = png ?? undefined;
+          if (png) {
+            // Soft signal in the browser console so the user can
+            // confirm a fresh capture happened on each click — handy
+            // when GitHub's image CDN caches the previous version.
+            // eslint-disable-next-line no-console
+            console.info(
+              "[sync] captured fresh canvas screenshot (%d KB)",
+              Math.round(png.length / 1024)
+            );
+          }
+        } catch (err) {
+          // Screenshot capture is best-effort — sync still proceeds
+          // without an image if html-to-image trips on something.
+          // eslint-disable-next-line no-console
+          console.warn("[sync] canvas screenshot failed", err);
+        }
+        const result = await pushTopologyToGithub(t.id, screenshot);
+        // Reflect the new github_repo / github_synced_at on the row.
+        setTopologies((cur) =>
+          cur.map((x) => (x.id === result.topology.id ? result.topology : x))
+        );
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("[sync topology]", err);
+      } finally {
+        setSyncingTopologyId(null);
+      }
+    },
+    [githubStatus?.configured, syncingTopologyId, confirm, activeTopologyId]
   );
 
   const handleDeleteTemplate = useCallback(
@@ -321,13 +446,15 @@ function AppInner() {
       if (!ok) return;
       await deleteTopology(t.id);
       setTopologies((cur) => cur.filter((x) => x.id !== t.id));
+      // If we just deleted the topology that was on the canvas,
+      // clear it (set active=null) so we don't show stale data from
+      // a now-deleted record. The user can click any remaining
+      // topology in the rail to switch back into it.
       if (activeTopologyId === t.id) {
-        // Switch to another topology if any, else null.
-        const next = topologies.find((x) => x.id !== t.id) ?? null;
-        setActiveTopologyId(next?.id ?? null);
+        setActiveTopologyId(null);
       }
     },
-    [activeTopologyId, topologies, confirm]
+    [activeTopologyId, confirm]
   );
 
   // ── Per-turn persistence ─────────────────────────────────────
@@ -346,6 +473,15 @@ function AppInner() {
       userPrompt: string
     ) => {
       if (!current) return;
+      // Always clear the optimistic "destroying" badge when a
+      // destroy-related turn ends, regardless of outcome — the row
+      // chip then reflects t.status (destroyed on success, live or
+      // failed on partial outcomes).
+      const clearDestroying = () => {
+        if (teardownTargetId && destroyingTopologyId === teardownTargetId) {
+          setDestroyingTopologyId(null);
+        }
+      };
       try {
         // Per-topology destroy (rail-initiated) → only flip when a
         // teardown target was queued AND destroy_azure resolved with
@@ -353,16 +489,34 @@ function AppInner() {
         // instead of stage so a destroy that happens via a typed-in
         // build-stage message (rare but possible) still gets honoured.
         if (teardownTargetId && destroy === "success") {
+          // Carry the existing topology JSON forward but stamp every
+          // node's status as "destroyed" so the canvas dims them in
+          // place (rather than wiping). The user can still see what
+          // was there at the moment of teardown — useful for audit.
+          const existing = topologies.find((t) => t.id === teardownTargetId);
+          const newTopology = existing?.topology
+            ? {
+                nodes: existing.topology.nodes.map((n) => ({
+                  ...n,
+                  status: "destroyed" as const,
+                })),
+                edges: existing.topology.edges,
+              }
+            : { nodes: [], edges: [] };
           const updated = await patchTopology(teardownTargetId, {
             status: "destroyed",
-            topology: { nodes: [], edges: [] },
+            topology: newTopology,
           });
           setTopologies((cur) =>
             cur.map((t) => (t.id === updated.id ? updated : t))
           );
+          clearDestroying();
           return;
         }
-        // destroy "failed" / "incomplete" / null → leave status alone.
+        // destroy "failed" / "incomplete" / null → leave status alone,
+        // but still drop the optimistic in-flight badge so the row
+        // chip falls back to the persisted t.status (typically "live").
+        clearDestroying();
 
         // Deploy outcome (regardless of stage label). The user can
         // retry a failed push by typing a follow-up message — that
@@ -440,7 +594,7 @@ function AppInner() {
         console.error("[persistBuildAfterTurn]", err);
       }
     },
-    [current, activeTopologyId, topologies]
+    [current, activeTopologyId, topologies, destroyingTopologyId]
   );
 
   // ── Live state mutators (no persistence yet — that's per turn) ──
@@ -522,11 +676,15 @@ function AppInner() {
           topologies={topologies}
           activeTopologyId={activeTopologyId}
           templatesRefreshKey={templatesRefreshKey}
+          syncingTopologyId={syncingTopologyId}
+          destroyingTopologyId={destroyingTopologyId}
+          githubAvailable={!!githubStatus?.configured}
           onSelect={select}
           onSelectTopology={handleSelectTopology}
           onNewTopology={() => void handleNewTopology()}
           onRenameTopology={(t, newName) => void handleRenameTopology(t, newName)}
           onDeleteTopology={(t) => void handleDeleteTopology(t)}
+          onSyncTopologyToGithub={(t) => void handleSyncTopologyToGithub(t)}
           onLoadTemplate={(t) => void handleLoadTemplate(t)}
           onDeleteTemplate={(t) => void handleDeleteTemplate(t)}
           onDestroyTopology={async (t) => {
@@ -551,6 +709,10 @@ function AppInner() {
             });
             if (!ok) return;
             setActiveTopologyId(t.id);
+            // Optimistic UI: mark this topology as destroying right
+            // away so the row chip + button reflect the in-flight
+            // state. Cleared in persistBuildAfterTurn (any outcome).
+            setDestroyingTopologyId(t.id);
             setPendingDestroy({ topologyId: t.id, key: Date.now() });
           }}
         />

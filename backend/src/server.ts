@@ -31,6 +31,11 @@ const app = Fastify({
   logger: {
     level: process.env.NODE_ENV === "production" ? "info" : "debug",
   },
+  // Default body limit is 1 MiB. The topology-sync endpoint accepts a
+  // base64-encoded canvas screenshot (typically <500 KB encoded but
+  // can be a couple MB on a busy canvas), so bump to 8 MiB here. The
+  // route itself enforces a 5 MB cap on the decoded PNG.
+  bodyLimit: 8 * 1024 * 1024,
 });
 
 // Same-origin in production (nginx serves frontend + proxies /api). CORS

@@ -3,15 +3,20 @@
 
 import { useState } from "react";
 import { createTemplate } from "../../lib/api";
+import type { Topology } from "../../lib/parse-topology";
 
 type Props = {
   open: boolean;
   bicep: string | null;
+  /** Canvas state at the moment the drawer was opened. Captured into
+   *  the template alongside the Bicep so re-loading the template can
+   *  render the canvas directly without an LLM round-trip. */
+  topology?: Topology | null;
   onClose: () => void;
   onSaved: (templateName: string) => void;
 };
 
-export function BicepDrawer({ open, bicep, onClose, onSaved }: Props) {
+export function BicepDrawer({ open, bicep, topology, onClose, onSaved }: Props) {
   const [savingName, setSavingName] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -35,7 +40,11 @@ export function BicepDrawer({ open, bicep, onClose, onSaved }: Props) {
     setError(null);
     setBusy(true);
     try {
-      const t = await createTemplate({ name: savingName, bicep });
+      const t = await createTemplate({
+        name: savingName,
+        bicep,
+        topology: topology ?? null,
+      });
       onSaved(t.name);
       setSavingName(null);
     } catch (e) {

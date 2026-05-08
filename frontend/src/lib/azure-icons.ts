@@ -11,7 +11,11 @@ export type AzureNodeStatus =
   | "pending"
   | "deploying"
   | "success"
-  | "failed";
+  | "failed"
+  // Set on every node after a per-topology destroy completes — keeps
+  // the resource visible on the canvas (so the user can see what was
+  // there) but visually marks it as gone.
+  | "destroyed";
 
 export type AzureResourceKind =
   | "resource-group"

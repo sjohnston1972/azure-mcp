@@ -151,10 +151,21 @@ export function ProjectSwitcher({
                               <span className="material-symbols-outlined text-[12px] text-on-surface-variant">
                                 hub
                               </span>
-                              {p.github_synced_at ? (
-                                <span className="text-secondary font-semibold">
-                                  GitHub · synced {fmtAgo(p.github_synced_at)}
-                                </span>
+                              {p.github_synced_at && p.github_repo ? (
+                                // Clickable link to the actual repo so
+                                // the user can jump straight from the
+                                // dropdown — same pattern as the
+                                // topology row's footer link.
+                                <a
+                                  href={`https://github.com/${p.github_repo}`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="text-secondary font-semibold underline decoration-dotted hover:text-on-surface"
+                                >
+                                  {p.github_repo} · synced{" "}
+                                  {fmtAgo(p.github_synced_at)}
+                                </a>
                               ) : (
                                 <span className="text-on-surface-variant">
                                   GitHub · never synced
@@ -172,16 +183,34 @@ export function ProjectSwitcher({
                             }}
                             disabled={syncingId === p.id}
                             title={
-                              p.github_repo
-                                ? `Re-sync to ${p.github_repo}`
-                                : `Sync to GitHub (will create ${githubStatus?.owner}/azure-mcp-${p.name})`
+                              syncingId === p.id
+                                ? "Syncing to GitHub…"
+                                : p.github_repo
+                                  ? `Re-sync to ${p.github_repo}`
+                                  : // Mirror the actual backend repo name format:
+                                    // azure-mcp-<slug>-<project-uuid8>. Without
+                                    // the UUID suffix the hint was misleading
+                                    // since the real repo includes it.
+                                    `Sync to GitHub (will create ${
+                                      githubStatus?.owner
+                                    }/azure-mcp-${p.name
+                                      .toLowerCase()
+                                      .replace(/[^a-z0-9_.-]/g, "-")}-${p.id
+                                      .replace(/-/g, "")
+                                      .slice(0, 8)})`
                             }
                             className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-bold text-primary border border-primary/30 bg-primary/5 hover:bg-primary/15 transition-colors disabled:opacity-50"
                           >
-                            <span className="material-symbols-outlined text-[14px]">
-                              {syncingId === p.id ? "sync" : "cloud_upload"}
+                            <span
+                              className={`material-symbols-outlined text-[14px] ${
+                                syncingId === p.id ? "animate-spin" : ""
+                              }`}
+                            >
+                              {syncingId === p.id
+                                ? "progress_activity"
+                                : "cloud_upload"}
                             </span>
-                            {syncingId === p.id ? "Syncing…" : "Sync"}
+                            {syncingId === p.id ? "Syncing…" : "GitHub"}
                           </button>
                         )}
                         <button

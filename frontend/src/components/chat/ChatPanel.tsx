@@ -368,6 +368,7 @@ export function ChatPanel({
       <BicepDrawer
         open={drawerOpen}
         bicep={build?.bicep ?? null}
+        topology={build?.topology ?? null}
         onClose={() => setDrawerOpen(false)}
         onSaved={() => {
           // Give a small UX hint by closing the drawer, and let the

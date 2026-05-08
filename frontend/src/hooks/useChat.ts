@@ -185,6 +185,36 @@ export function useChat(cb: Callbacks = {}) {
         );
       };
 
+      // Per-turn outcome reporter. Idempotent — called from `done`,
+      // from the error event suppress branch, and from the catch
+      // block, but only fires once. Without this, a stream that
+      // errors AFTER deploy_bicep / destroy_azure has resolved
+      // successfully leaves the topology row stuck on its prior
+      // status (the resources are live in Azure but the UI never
+      // hears about it).
+      let outcomeReported = false;
+      const reportOutcome = () => {
+        if (outcomeReported) return;
+        outcomeReported = true;
+        const lastDeploy = [...toolResults]
+          .reverse()
+          .find((tr) => tr.name === "deploy_bicep");
+        const lastDestroy = [...toolResults]
+          .reverse()
+          .find((tr) => tr.name === "destroy_azure");
+        const statusFor = (tool: typeof lastDeploy): ToolStatus => {
+          if (!tool) return null;
+          if (!tool.outcome.resolved) return "incomplete";
+          return tool.outcome.isError ? "failed" : "success";
+        };
+        cbRef.current.onTurnComplete?.({
+          stage,
+          deploy: statusFor(lastDeploy),
+          destroy: statusFor(lastDestroy),
+          userPrompt: text,
+        });
+      };
+
       try {
         const res = await streamChat(
           newMessages,
@@ -272,7 +302,10 @@ export function useChat(cb: Callbacks = {}) {
             const { message } = JSON.parse(evt.data) as { message: string };
             // What was the last interesting tool's state at the moment
             // the stream died? Three cases:
-            //   - resolved-success: pure post-success noise → suppress
+            //   - resolved-success: pure post-success noise → suppress,
+            //     but STILL fire onTurnComplete so the topology row
+            //     flips to live/destroyed (otherwise Azure has the
+            //     resources but the UI thinks nothing happened).
             //   - resolved-failure: alarming red pill is fine
             //   - unresolved (e.g. tool_use sent but tool_result never
             //     came back): replace the cryptic "Error in input
@@ -287,7 +320,10 @@ export function useChat(cb: Callbacks = {}) {
               lastInteresting?.outcome.resolved === true &&
               !lastInteresting.outcome.isError
             ) {
-              // Suppress — Azure is live, stream hiccup is noise.
+              // Suppress the user-facing error — Azure is in the right
+              // state, the stream hiccup is noise. But propagate the
+              // outcome so the topology row updates.
+              reportOutcome();
             } else if (
               lastInteresting &&
               !lastInteresting.outcome.resolved
@@ -299,8 +335,11 @@ export function useChat(cb: Callbacks = {}) {
                   ` — check the Azure portal before retrying. ` +
                   `Topology status left unchanged.`
               );
+              // Report so listeners can clear any "in-flight" UI state.
+              reportOutcome();
             } else {
               setError(message);
+              reportOutcome();
             }
           } else if (evt.event === "done") {
             setDisplay((d) =>
@@ -310,38 +349,7 @@ export function useChat(cb: Callbacks = {}) {
                   : m
               )
             );
-            // Per-tool outcome (used by App to flip topology status).
-            // We compute these regardless of stage because the user can
-            // — and frequently does — type a follow-up message after a
-            // failed push (which goes out as stage='build') and Claude
-            // retries deploy_bicep within that build turn. The stage
-            // label is unreliable; what actually ran is reliable.
-            //
-            // Per tool:
-            //   - LAST resolved call's is_error  → "success" / "failed"
-            //   - LAST call still unresolved     → "incomplete"
-            //   - Tool never called this turn    → null
-            const lastDeploy = [...toolResults]
-              .reverse()
-              .find((t) => t.name === "deploy_bicep");
-            const lastDestroy = [...toolResults]
-              .reverse()
-              .find((t) => t.name === "destroy_azure");
-
-            const statusFor = (
-              tool: typeof lastDeploy
-            ): ToolStatus => {
-              if (!tool) return null;
-              if (!tool.outcome.resolved) return "incomplete";
-              return tool.outcome.isError ? "failed" : "success";
-            };
-
-            cbRef.current.onTurnComplete?.({
-              stage,
-              deploy: statusFor(lastDeploy),
-              destroy: statusFor(lastDestroy),
-              userPrompt: text,
-            });
+            reportOutcome();
           }
         }
       } catch (e) {
@@ -358,6 +366,10 @@ export function useChat(cb: Callbacks = {}) {
               : m
           )
         );
+        // Even on a thrown stream error, propagate any tool outcomes
+        // that resolved before the error so the UI can settle (clear
+        // optimistic in-flight state, flip topology row if applicable).
+        reportOutcome();
       } finally {
         setSending(false);
         abortRef.current = null;

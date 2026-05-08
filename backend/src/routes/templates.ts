@@ -8,14 +8,18 @@ type TemplateRow = {
   name: string;
   description: string | null;
   bicep: string;
+  topology: unknown;
   source_deployment_id: string | null;
   created_at: string;
 };
 
+const TEMPLATE_COLS =
+  "id, name, description, bicep, topology, source_deployment_id, created_at";
+
 export async function templateRoutes(app: FastifyInstance) {
   app.get("/api/templates", async () => {
     const { rows } = await pool.query<TemplateRow>(
-      "SELECT id, name, description, bicep, source_deployment_id, created_at FROM templates ORDER BY created_at DESC"
+      `SELECT ${TEMPLATE_COLS} FROM templates ORDER BY created_at DESC`
     );
     return rows;
   });
@@ -24,7 +28,7 @@ export async function templateRoutes(app: FastifyInstance) {
     "/api/templates/:id",
     async (req, reply) => {
       const { rows } = await pool.query<TemplateRow>(
-        "SELECT * FROM templates WHERE id = $1",
+        `SELECT ${TEMPLATE_COLS} FROM templates WHERE id = $1`,
         [req.params.id]
       );
       if (rows.length === 0) return reply.code(404).send({ error: "not found" });
@@ -37,6 +41,7 @@ export async function templateRoutes(app: FastifyInstance) {
       name: string;
       description?: string;
       bicep: string;
+      topology?: unknown;
       source_deployment_id?: string;
     };
   }>("/api/templates", async (req, reply) => {
@@ -51,10 +56,17 @@ export async function templateRoutes(app: FastifyInstance) {
     }
     try {
       const { rows } = await pool.query<TemplateRow>(
-        `INSERT INTO templates (name, description, bicep, source_deployment_id)
-         VALUES ($1, $2, $3, $4)
-         RETURNING *`,
-        [b.name, b.description ?? null, b.bicep, b.source_deployment_id ?? null]
+        `INSERT INTO templates (name, description, bicep, topology, source_deployment_id)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING ${TEMPLATE_COLS}`,
+        [
+          b.name,
+          b.description ?? null,
+          b.bicep,
+          // jsonb column — null when caller didn't capture a canvas.
+          b.topology ? JSON.stringify(b.topology) : null,
+          b.source_deployment_id ?? null,
+        ]
       );
       return reply.code(201).send(rows[0]);
     } catch (err) {

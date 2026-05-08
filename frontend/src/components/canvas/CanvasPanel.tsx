@@ -173,7 +173,14 @@ function CanvasInner({ topology, projectId, onExamplePrompt }: Props) {
   }, [graph]);
 
   const loadDemo = () => setOverride(topologyToFlow(buildDemo()));
-  const clearOverride = () => setOverride(null);
+  // "Clear canvas" — wipe the visible graph entirely. We set the
+  // override to an explicit empty graph (NOT null) so it doesn't
+  // immediately fall back to the upstream topology from chat. If
+  // Claude later emits a fresh <topology> marker, the upstream
+  // topology change resets the override automatically (see the
+  // useEffect on [topology, projectId] above) and the new design
+  // appears.
+  const clearCanvas = () => setOverride({ nodes: [], edges: [] });
 
   return (
     <section className="rounded-xl bg-surface-container-lowest border border-outline-variant/40 shadow-sm overflow-hidden flex flex-col h-full">
@@ -198,16 +205,17 @@ function CanvasInner({ topology, projectId, onExamplePrompt }: Props) {
               Load demo
             </button>
           ) : (
-            override && (
-              <button
-                type="button"
-                onClick={clearOverride}
-                className="px-3 py-1.5 rounded-lg border border-outline-variant/40 text-xs font-semibold hover:bg-surface-container-high transition-colors"
-                title="Discard local edits and snap back to Claude's last proposed topology"
-              >
-                Reset to chat
-              </button>
-            )
+            <button
+              type="button"
+              onClick={clearCanvas}
+              className="px-3 py-1.5 rounded-lg border border-outline-variant/40 text-xs font-semibold hover:bg-surface-container-high transition-colors flex items-center gap-1.5"
+              title="Wipe everything from the canvas. The next chat turn that emits a topology will repopulate it."
+            >
+              <span className="material-symbols-outlined text-[14px]">
+                ink_eraser
+              </span>
+              Clear canvas
+            </button>
           )}
         </div>
       </div>

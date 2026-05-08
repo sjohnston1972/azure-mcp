@@ -83,6 +83,23 @@ export async function migrate(): Promise<void> {
     ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_repo TEXT;
     ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_synced_at TIMESTAMPTZ;
   `);
+
+  // Same shape on topologies — per-topology sync writes the topology's
+  // own bicep + canvas JSON + screenshot to its own repo, separate
+  // from the project-level repo. Once set we keep the same name so
+  // re-syncs update the existing repo rather than churn names.
+  await pool.query(`
+    ALTER TABLE topologies ADD COLUMN IF NOT EXISTS github_repo TEXT;
+    ALTER TABLE topologies ADD COLUMN IF NOT EXISTS github_synced_at TIMESTAMPTZ;
+  `);
+
+  // Capture the canvas-state JSON alongside the Bicep when saving a
+  // template. Loading a template can then render the canvas directly
+  // from saved data — no need to round-trip through Claude to derive
+  // a <topology> marker from the raw Bicep.
+  await pool.query(`
+    ALTER TABLE templates ADD COLUMN IF NOT EXISTS topology JSONB;
+  `);
   // eslint-disable-next-line no-console
   console.log("[db] migrations applied");
 }

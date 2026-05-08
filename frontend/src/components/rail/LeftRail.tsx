@@ -25,12 +25,20 @@ type Props = {
   /** Bumped by App after a save/delete to force the templates list
    *  to reload without the user having to flip tabs. */
   templatesRefreshKey?: number;
+  /** Topology id currently being synced to GitHub (passed through to
+   *  TopologiesList so the row can spinner/disable). */
+  syncingTopologyId?: string | null;
+  /** Topology id currently mid-destroy. Same pattern as sync. */
+  destroyingTopologyId?: string | null;
+  /** Whether GitHub sync is available at all (env var configured). */
+  githubAvailable?: boolean;
   onSelect: (p: Project) => void;
   onSelectTopology: (t: TopologyRecord) => void;
   onNewTopology: () => void;
   onRenameTopology: (t: TopologyRecord, newName: string) => void;
   onDeleteTopology: (t: TopologyRecord) => void;
   onDestroyTopology: (t: TopologyRecord) => void;
+  onSyncTopologyToGithub?: (t: TopologyRecord) => void;
   onLoadTemplate: (t: Template) => void;
   onDeleteTemplate: (t: Template) => void;
 };
@@ -41,12 +49,16 @@ export function LeftRail({
   topologies,
   activeTopologyId,
   templatesRefreshKey,
+  syncingTopologyId,
+  destroyingTopologyId,
+  githubAvailable,
   onSelect,
   onSelectTopology,
   onNewTopology,
   onRenameTopology,
   onDeleteTopology,
   onDestroyTopology,
+  onSyncTopologyToGithub,
   onLoadTemplate,
   onDeleteTemplate,
 }: Props) {
@@ -123,11 +135,15 @@ export function LeftRail({
               <TopologiesList
                 topologies={topologies}
                 activeTopologyId={activeTopologyId}
+                syncingTopologyId={syncingTopologyId}
+                destroyingTopologyId={destroyingTopologyId}
+                githubAvailable={!!githubAvailable}
                 onSelect={onSelectTopology}
                 onNewTopology={onNewTopology}
                 onRename={onRenameTopology}
                 onDelete={onDeleteTopology}
                 onDestroy={onDestroyTopology}
+                onSyncToGithub={onSyncTopologyToGithub}
               />
             ) : (
               <p className="text-xs text-on-surface-variant">

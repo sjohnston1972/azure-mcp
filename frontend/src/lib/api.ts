@@ -99,6 +99,9 @@ export async function createTemplate(input: {
   name: string;
   description?: string;
   bicep: string;
+  /** Canvas state at save time. Saved alongside the Bicep so loading
+   *  a template doesn't have to ask Claude to re-derive a topology. */
+  topology?: Topology | null;
   source_deployment_id?: string;
 }): Promise<Template> {
   const res = await fetch("/api/templates", {
@@ -217,4 +220,37 @@ export async function patchTopology(
 export async function deleteTopology(id: string): Promise<void> {
   const res = await fetch(`/api/topologies/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`/api/topologies/${id} → ${res.status}`);
+}
+
+export type TopologyGithubPushResult = {
+  ok: boolean;
+  repo: string;
+  repo_url: string;
+  repo_was_created: boolean;
+  bicep_files_synced: number;
+  screenshot_synced: boolean;
+  topology: TopologyRecord;
+};
+
+/** Push a single topology to its own GitHub repo. The screenshot is
+ *  optional — if supplied as a PNG data URL, the backend strips the
+ *  data: prefix and saves the bytes as screenshot.png in the repo. */
+export async function pushTopologyToGithub(
+  id: string,
+  screenshotPngBase64?: string
+): Promise<TopologyGithubPushResult> {
+  const res = await fetch(`/api/topologies/${id}/github/push`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(
+      screenshotPngBase64
+        ? { screenshot_png_base64: screenshotPngBase64 }
+        : {}
+    ),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`/api/topologies/${id}/github/push → ${res.status}: ${t}`);
+  }
+  return res.json();
 }

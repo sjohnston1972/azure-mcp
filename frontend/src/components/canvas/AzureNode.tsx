@@ -40,6 +40,11 @@ const STATUS_CHIP: Record<
     pulse: false,
   },
   failed: { label: "failed", cls: "bg-error/15 text-error", pulse: false },
+  destroyed: {
+    label: "destroyed",
+    cls: "bg-outline-variant/25 text-on-surface-variant",
+    pulse: false,
+  },
 };
 
 export function AzureNode({ data }: NodeProps) {
@@ -48,9 +53,13 @@ export function AzureNode({ data }: NodeProps) {
   const tone = TONE_FOR[d.kind] ?? TONE_FOR.generic;
   const status = STATUS_CHIP[d.status];
 
+  // Dim destroyed nodes so the canvas at-a-glance reads "this whole
+  // thing is gone" without the user having to read every chip.
+  const dimmed = d.status === "destroyed" ? "opacity-50 grayscale" : "";
+
   return (
     <div
-      className="rounded-xl bg-surface-container-lowest border border-outline-variant/40 shadow-sm hover:shadow-md transition-shadow"
+      className={`rounded-xl bg-surface-container-lowest border border-outline-variant/40 shadow-sm hover:shadow-md transition-shadow ${dimmed}`}
       style={{ width: 200, minHeight: 84 }}
     >
       <Handle

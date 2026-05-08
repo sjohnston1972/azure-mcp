@@ -120,6 +120,10 @@ export type Template = {
   name: string;
   description: string | null;
   bicep: string;
+  /** Canvas state captured at save time. When non-null, loading a
+   *  template can render the canvas directly without round-tripping
+   *  through Claude to derive a topology marker from the Bicep. */
+  topology: import("./parse-topology").Topology | null;
   source_deployment_id: string | null;
   created_at: string;
 };
@@ -138,6 +142,8 @@ export type TopologyRecord = {
   pushed_at: string | null;
   destroyed_at: string | null;
   pushed_deployment_id: string | null;
+  github_repo: string | null;
+  github_synced_at: string | null;
   created_at: string;
   updated_at: string;
 };

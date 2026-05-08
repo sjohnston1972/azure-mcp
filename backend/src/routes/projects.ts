@@ -152,7 +152,18 @@ export async function projectRoutes(app: FastifyInstance) {
       );
       const topologies = topoRes.rows;
 
-      const repoName = repoNameForProject(project.name);
+      // If the project has been synced before, keep the same repo name
+      // (the user may have starred / forked / pinned it). For first-time
+      // syncs, generate a fresh name with the project UUID short suffix
+      // so two projects with the same display name don't collide.
+      let repoName: string;
+      if (project.github_repo) {
+        const slash = project.github_repo.indexOf("/");
+        repoName =
+          slash >= 0 ? project.github_repo.slice(slash + 1) : project.github_repo;
+      } else {
+        repoName = repoNameForProject(project.name, project.id);
+      }
       const owner = config.GH_OWNER;
 
       try {
