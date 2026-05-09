@@ -245,6 +245,10 @@ export type ResourceDetails = {
   props: Record<string, unknown>;
   /** Raw cloud-API response for the modal's "Raw" tab. */
   raw?: unknown;
+  /** ISO timestamp of the post-deploy prefetch. Present when the
+   *  detail came from the topology's live_details cache, absent
+   *  when fetched live. Used to render "cached X ago". */
+  _cached_at?: string;
 };
 
 export async function fetchResourceDetails(
@@ -253,6 +257,26 @@ export async function fetchResourceDetails(
 ): Promise<ResourceDetails> {
   const url = `/api/topologies/${encodeURIComponent(topologyId)}/details/${encodeURIComponent(nodeId)}`;
   const res = await fetch(url);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`${url} → ${res.status}: ${text || res.statusText}`);
+  }
+  return res.json();
+}
+
+/** Force a synchronous re-fetch of every node's detail for this
+ *  topology. Used by the modal's refresh button when cached data
+ *  is stale (e.g. the user changed something in the portal). */
+export async function refreshTopologyDetails(
+  topologyId: string
+): Promise<{
+  ok: boolean;
+  refreshed_at: string;
+  node_count: number;
+  hits: number;
+}> {
+  const url = `/api/topologies/${encodeURIComponent(topologyId)}/details/refresh`;
+  const res = await fetch(url, { method: "POST" });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`${url} → ${res.status}: ${text || res.statusText}`);

@@ -337,9 +337,40 @@ async function main() {
     `[mft-detail] topology promoted to "${liveTopo.status}" with ${liveTopo.topology?.nodes?.length ?? 0} nodes (labels: ${(liveTopo.topology?.nodes ?? []).map((n) => n.label).join(", ")})`
   );
 
-  // Exercise the detail endpoint per node — single pass.
+  // The PATCH-to-live response kicked off a fire-and-forget prefetch
+  // on the backend. Poll the topology row until live_details lands or
+  // we've waited long enough — typically ~30s for our 6-node test.
   const liveNodes = liveTopo.topology?.nodes ?? [];
+  console.log(
+    `\n[mft-detail] waiting for backend prefetch to populate live_details (${liveNodes.length} nodes)…`
+  );
+  const prefetchT0 = Date.now();
+  const PREFETCH_TIMEOUT_MS = 90_000;
+  while (Date.now() - prefetchT0 < PREFETCH_TIMEOUT_MS) {
+    const r = await fetch(`${API}/api/topologies?project_id=${project.id}`);
+    const list = await r.json();
+    const t = list.find((x) => x.id === topo.id);
+    if (t?.live_details?.nodes && Object.keys(t.live_details.nodes).length > 0) {
+      console.log(
+        `[mft-detail] prefetch complete in ${((Date.now() - prefetchT0) / 1000).toFixed(1)}s — ${Object.keys(t.live_details.nodes).length} nodes cached at ${t.live_details._at}`
+      );
+      break;
+    }
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+
+  // Exercise the detail endpoint per node — should be DB-cache hits now.
   const cold = await exerciseDetailEndpoint(topo.id, liveNodes);
+
+  // After prefetch, every detail call should return in well under 1s
+  // (DB read, no CLI spawn). Flag any slow ones.
+  for (const r of cold) {
+    if (r.ok && r.dur > 1000) {
+      console.warn(
+        `[mft-detail] WARN: node ${r.node.id} took ${r.dur}ms after prefetch — expected <1s DB-cache hit`
+      );
+    }
+  }
 
   // Verify each node we expect to dispatch to a kind-specific fetcher
   // returned a non-empty `props` payload.
@@ -381,29 +412,24 @@ async function main() {
     `[mft-detail] kind-specific dispatches hit: ${kindHits}, warnings: ${warnings}, 4xx/5xx: ${failures}`
   );
 
-  // Focused cache test: hit the VM detail endpoint twice in quick
-  // succession; the second response must come from the 30s in-memory
-  // cache (sub-100ms vs the ~30s cold path of az vm show + per-NIC
-  // lookups). This is more reliable than measuring "warm pass over
-  // the whole topology" because the whole-topology cold pass takes
-  // longer than the cache TTL.
-  const vmNode = liveNodes.find((n) => n.kind === "vm");
-  if (vmNode) {
-    const url = `${API}/api/topologies/${topo.id}/details/${encodeURIComponent(vmNode.id)}`;
-    const t0 = Date.now();
-    await fetch(url);
-    const dur1 = Date.now() - t0;
-    const t1 = Date.now();
-    await fetch(url);
-    const dur2 = Date.now() - t1;
-    console.log(
-      `[mft-detail] cache test: 1st=${dur1}ms, 2nd=${dur2}ms (cache hit if 2nd << 1st)`
+  // Refresh endpoint test: forces the backend to re-query every node
+  // and overwrite live_details. Should succeed and return updated_at.
+  console.log(`\n[mft-detail] testing refresh endpoint…`);
+  const refreshT0 = Date.now();
+  const refreshRes = await fetch(
+    `${API}/api/topologies/${topo.id}/details/refresh`,
+    { method: "POST" }
+  );
+  const refreshDur = Date.now() - refreshT0;
+  if (!refreshRes.ok) {
+    console.warn(
+      `[mft-detail] WARN: refresh returned ${refreshRes.status}: ${await refreshRes.text()}`
     );
-    if (dur2 > 1000) {
-      console.warn(
-        `[mft-detail] WARN: 2nd request took ${dur2}ms — expected <100ms cache hit`
-      );
-    }
+  } else {
+    const j = await refreshRes.json();
+    console.log(
+      `[mft-detail] refresh complete in ${(refreshDur / 1000).toFixed(1)}s — ${j.hits}/${j.node_count} nodes refreshed at ${j.refreshed_at}`
+    );
   }
 
   if (failures > 0) {

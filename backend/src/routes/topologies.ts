@@ -19,9 +19,20 @@ import {
 import {
   getAzureResourceDetails,
   getAwsResourceDetails,
+  prefetchTopologyDetails,
+  type ResourceDetails,
 } from "../lib/resource-details.js";
 
 type Status = "draft" | "live" | "failed" | "destroyed";
+
+/** Persisted shape of the live_details JSONB column. _at is the
+ *  ISO timestamp of the last prefetch, used to render "last refreshed
+ *  X ago" in the modal. Null entries mean we tried and didn't find
+ *  the resource (negative cache). */
+type LiveDetails = {
+  _at: string;
+  nodes: Record<string, ResourceDetails | null>;
+};
 
 type TopologyRow = {
   id: string;
@@ -36,13 +47,50 @@ type TopologyRow = {
   pushed_deployment_id: string | null;
   github_repo: string | null;
   github_synced_at: string | null;
+  live_details: LiveDetails | null;
   created_at: string;
   updated_at: string;
 };
 
 const TOPOLOGY_COLS =
   "id, project_id, name, status, cloud, topology, bicep, pushed_at, destroyed_at, " +
-  "pushed_deployment_id, github_repo, github_synced_at, created_at, updated_at";
+  "pushed_deployment_id, github_repo, github_synced_at, live_details, created_at, updated_at";
+
+/** Background prefetch driver. Fires after a successful push so the
+ *  modal opens instantly the first time the user clicks any node.
+ *  We keep this fire-and-forget — failures are logged but never
+ *  surfaced to the PATCH caller (the deploy already succeeded; the
+ *  detail endpoint will fall back to a live API call if needed). */
+function kickOffPrefetch(t: TopologyRow): void {
+  const topo = t.topology as TopologyJson | null;
+  if (!topo?.nodes || topo.nodes.length === 0) return;
+  void (async () => {
+    try {
+      const map = await prefetchTopologyDetails({
+        topologyId: t.id,
+        cloud: t.cloud,
+        nodes: topo.nodes.map((n) => ({
+          id: n.id,
+          kind: n.kind,
+          label: n.label,
+        })),
+      });
+      const payload: LiveDetails = { _at: new Date().toISOString(), nodes: map };
+      await pool.query(
+        "UPDATE topologies SET live_details = $1 WHERE id = $2",
+        [JSON.stringify(payload), t.id]
+      );
+      // eslint-disable-next-line no-console
+      console.log(
+        `[prefetch] topology=${t.id} cached ${Object.keys(map).length} nodes`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // eslint-disable-next-line no-console
+      console.warn(`[prefetch] topology=${t.id} failed: ${msg}`);
+    }
+  })();
+}
 
 export async function topologyRoutes(app: FastifyInstance) {
   // List topologies for a project.
@@ -165,12 +213,21 @@ export async function topologyRoutes(app: FastifyInstance) {
     }
     if (sets.length === 0)
       return reply.code(400).send({ error: "no fields to update" });
+    // When transitioning to status='live' we also clear any stale
+    // live_details cache from a previous deploy — the prefetch we
+    // kick off after the UPDATE will repopulate it.
+    if (b.status === "live") sets.push(`live_details = NULL`);
     const { rows } = await pool.query<TopologyRow>(
       `UPDATE topologies SET ${sets.join(", ")} WHERE id = $1 RETURNING *`,
       vals
     );
-    if (rows.length === 0) return reply.code(404).send({ error: "not found" });
-    return rows[0];
+    const updated = rows[0];
+    if (!updated) return reply.code(404).send({ error: "not found" });
+    // Fire-and-forget prefetch when the topology transitioned to live —
+    // the user's first click on a node should then hit the DB cache
+    // (sub-50ms) instead of waiting ~17-30s for the cloud CLI.
+    if (b.status === "live") kickOffPrefetch(updated);
+    return updated;
   });
 
   // Delete = remove the record only. Azure resources, if live, stay.
@@ -378,6 +435,26 @@ export async function topologyRoutes(app: FastifyInstance) {
       const node = topo?.nodes.find((n) => n.id === req.params.nodeId);
       if (!node) return reply.code(404).send({ error: "node not found in topology" });
 
+      // Fast path: serve from the post-deploy prefetch cache. Cache is
+      // populated by kickOffPrefetch when the topology transitions to
+      // live — first click should hit this and return in <50ms instead
+      // of paying the ~17-30s CLI spawn cost.
+      const cached = t.live_details?.nodes?.[req.params.nodeId];
+      if (cached !== undefined) {
+        if (cached === null) {
+          return reply.code(404).send({
+            error:
+              "no live resource matched this node — check the topology was deployed cleanly",
+            cached: true,
+            cached_at: t.live_details?._at,
+          });
+        }
+        return { ...cached, _cached_at: t.live_details?._at };
+      }
+
+      // Fall through to the live API. This happens for older topologies
+      // deployed before the prefetch column existed, or while the
+      // background prefetch is still in flight.
       try {
         const details =
           t.cloud === "aws"
@@ -403,6 +480,63 @@ export async function topologyRoutes(app: FastifyInstance) {
         return reply
           .code(502)
           .send({ error: "failed to fetch live resource details", detail: message });
+      }
+    }
+  );
+
+  // POST /api/topologies/:id/details/refresh — force a synchronous
+  // re-fetch of every node's details. Used by the modal's refresh
+  // button when the user wants up-to-the-minute data (e.g. after
+  // making out-of-band changes in the Azure portal).
+  app.post<{ Params: { id: string } }>(
+    "/api/topologies/:id/details/refresh",
+    async (req, reply) => {
+      const topoRes = await pool.query<TopologyRow>(
+        `SELECT ${TOPOLOGY_COLS} FROM topologies WHERE id = $1`,
+        [req.params.id]
+      );
+      const t = topoRes.rows[0];
+      if (!t) return reply.code(404).send({ error: "topology not found" });
+      if (t.status !== "live") {
+        return reply
+          .code(400)
+          .send({ error: "topology is not live", status: t.status });
+      }
+      const topo = t.topology as TopologyJson | null;
+      if (!topo?.nodes || topo.nodes.length === 0) {
+        return reply.code(400).send({ error: "topology has no nodes" });
+      }
+      try {
+        const map = await prefetchTopologyDetails({
+          topologyId: t.id,
+          cloud: t.cloud,
+          nodes: topo.nodes.map((n) => ({
+            id: n.id,
+            kind: n.kind,
+            label: n.label,
+          })),
+          // Bypass the in-memory 30s cache — this is an explicit refresh.
+          force: true,
+        });
+        const payload: LiveDetails = {
+          _at: new Date().toISOString(),
+          nodes: map,
+        };
+        await pool.query(
+          "UPDATE topologies SET live_details = $1 WHERE id = $2",
+          [JSON.stringify(payload), t.id]
+        );
+        return {
+          ok: true,
+          refreshed_at: payload._at,
+          node_count: Object.keys(map).length,
+          hits: Object.values(map).filter((v) => v !== null).length,
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return reply
+          .code(502)
+          .send({ error: "refresh failed", detail: message });
       }
     }
   );

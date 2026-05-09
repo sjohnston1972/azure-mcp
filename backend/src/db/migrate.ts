@@ -131,6 +131,16 @@ export async function migrate(): Promise<void> {
     FROM projects p
     WHERE t.project_id = p.id AND t.cloud IS NULL;
   `);
+
+  // Live cloud-API details cache. Populated post-deploy by a fire-and-
+  // forget background prefetch over every topology node, so the modal
+  // opens instantly on click instead of waiting ~17-30s per node for
+  // the az/aws CLI to spawn. Shape: { [nodeId]: ResourceDetails | null,
+  // _at: ISO-timestamp }. Null means the prefetch ran but found no
+  // matching live resource. Refresh button on the modal repopulates.
+  await pool.query(`
+    ALTER TABLE topologies ADD COLUMN IF NOT EXISTS live_details JSONB;
+  `);
   // eslint-disable-next-line no-console
   console.log("[db] migrations applied");
 }

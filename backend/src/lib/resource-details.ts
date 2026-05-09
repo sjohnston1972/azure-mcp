@@ -637,10 +637,15 @@ export async function getAzureResourceDetails(input: {
   topologyId: string;
   nodeKind: string;
   nodeLabel: string;
+  /** Bypass the in-memory cache. Used by the explicit refresh path
+   *  so the user gets fresh data instead of the stale 30s entry. */
+  force?: boolean;
 }): Promise<ResourceDetails | null> {
   const cacheKey = `azure:${input.topologyId}:${input.nodeKind}:${input.nodeLabel}`;
-  const cached = cacheGet(cacheKey);
-  if (cached !== undefined) return cached;
+  if (!input.force) {
+    const cached = cacheGet(cacheKey);
+    if (cached !== undefined) return cached;
+  }
 
   // Special cases that bypass the tag-list lookup:
   //
@@ -718,10 +723,55 @@ export async function getAwsResourceDetails(_input: {
   topologyId: string;
   nodeKind: string;
   nodeLabel: string;
+  force?: boolean;
 }): Promise<ResourceDetails | null> {
   // TODO(aws): tag-resource-groups-api lookup + per-kind fetchers
   // for EC2, RDS, NAT GW, S3.
   return null;
+}
+
+// ── Bulk prefetch (post-deploy DB cache) ────────────────────────
+// After a successful deploy the topology row's status flips to
+// "live". The route handler kicks off this function in the
+// background to populate every node's detail entry, so the user's
+// first click on the canvas opens the modal instantly instead of
+// paying the ~17-30s CLI spawn cost per resource.
+//
+// We parallelise across nodes (each fetch is independent) but the
+// in-process cache means re-runs of the same topology are cheap.
+
+export async function prefetchTopologyDetails(input: {
+  topologyId: string;
+  cloud: "azure" | "aws";
+  nodes: Array<{ id: string; kind: string; label: string }>;
+  /** Force-refresh ignores the in-memory cache. Used by the explicit
+   *  /details/refresh endpoint when the user wants up-to-the-minute
+   *  data. The post-deploy auto-prefetch leaves this false so we
+   *  reuse anything the user might have already clicked through. */
+  force?: boolean;
+}): Promise<Record<string, ResourceDetails | null>> {
+  const fetcher =
+    input.cloud === "aws" ? getAwsResourceDetails : getAzureResourceDetails;
+  const results = await Promise.all(
+    input.nodes.map(async (n) => {
+      try {
+        const r = await fetcher({
+          topologyId: input.topologyId,
+          nodeKind: n.kind,
+          nodeLabel: n.label,
+          force: input.force,
+        });
+        return [n.id, r] as const;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[prefetch] node ${n.id} (${n.kind}/${n.label}) failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+        return [n.id, null] as const;
+      }
+    })
+  );
+  return Object.fromEntries(results);
 }
 
 // Re-export the kind→type table for tests / docs.

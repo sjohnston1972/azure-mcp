@@ -8,6 +8,7 @@
 import { useEffect, useState } from "react";
 import {
   fetchResourceDetails,
+  refreshTopologyDetails,
   type ResourceDetails,
 } from "../../lib/api";
 
@@ -21,6 +22,7 @@ type Props = {
 export function ResourceDetailModal({ open, topologyId, nodeId, onClose }: Props) {
   const [data, setData] = useState<ResourceDetails | null>(null);
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<"details" | "raw">("details");
 
@@ -35,6 +37,25 @@ export function ResourceDetailModal({ open, topologyId, nodeId, onClose }: Props
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
   }, [open, topologyId, nodeId]);
+
+  // Refresh: forces the backend to re-query every node in the topology
+  // and update the persisted cache, then re-renders the current node.
+  // Slow (~30s for the full topology) but only used when the user
+  // actively wants up-to-the-minute data.
+  const onRefresh = async () => {
+    if (!topologyId || !nodeId) return;
+    setRefreshing(true);
+    setError(null);
+    try {
+      await refreshTopologyDetails(topologyId);
+      const next = await fetchResourceDetails(topologyId, nodeId);
+      setData(next);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   if (!open) return null;
 
@@ -59,6 +80,22 @@ export function ResourceDetailModal({ open, topologyId, nodeId, onClose }: Props
             </p>
           </div>
           <div className="flex items-center gap-2">
+            {data && (
+              <button
+                type="button"
+                onClick={onRefresh}
+                disabled={refreshing}
+                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-outline-variant/40 text-xs font-bold text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Re-query the cloud API for every node in this topology and update the cache. Slow (~30s)."
+              >
+                <span
+                  className={`material-symbols-outlined text-[14px] ${refreshing ? "animate-spin" : ""}`}
+                >
+                  refresh
+                </span>
+                {refreshing ? "Refreshing…" : "Refresh"}
+              </button>
+            )}
             {data?.console_url && (
               <a
                 href={data.console_url}
@@ -128,6 +165,14 @@ export function ResourceDetailModal({ open, topologyId, nodeId, onClose }: Props
                     {k}={k === "mcp-topology-id" ? `${v.slice(0, 8)}…` : v}
                   </span>
                 ))}
+              {data._cached_at && (
+                <span
+                  className="ml-auto text-[10px] text-on-surface-variant italic"
+                  title={`Last refreshed ${data._cached_at}`}
+                >
+                  cached {timeAgo(data._cached_at)}
+                </span>
+              )}
             </div>
 
             <div className="px-6 py-2 border-b border-outline-variant/30 flex items-center gap-1">
@@ -155,6 +200,19 @@ export function ResourceDetailModal({ open, topologyId, nodeId, onClose }: Props
       </div>
     </div>
   );
+}
+
+/** Human-readable "X ago" formatter for the cached_at timestamp. */
+function timeAgo(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 0 || Number.isNaN(ms)) return "just now";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
 function stateChipClass(state: string): string {
