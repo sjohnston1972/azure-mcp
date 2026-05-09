@@ -316,10 +316,31 @@ Rules for \`<bicep>\`:
 
 ### EC2 / RDS / Lambda quick gotchas
 
-- **EC2 \`ImageId\` should resolve dynamically.** Hardcoding an AMI ID locks you to one region. Use the SSM parameter:
-  \`ImageId: !Sub '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}'\`
+- **EC2 \`ImageId\` — TWO valid patterns, both important.** CloudFormation rejects \`{{resolve:ssm:...}}\` as a Parameter Default value with \`Template error: parameter X should not contain ssm versionless resolver\`. Use ONE of these instead:
+  1. **Inline on the resource property** (simplest):
+     \`\`\`yaml
+     Resources:
+       Hub:
+         Type: AWS::EC2::Instance
+         Properties:
+           ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+     \`\`\`
+  2. **Typed Parameter** (cleaner if multiple instances share the AMI):
+     \`\`\`yaml
+     Parameters:
+       AmiId:
+         Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+         Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+     Resources:
+       Hub:
+         Type: AWS::EC2::Instance
+         Properties:
+           ImageId: !Ref AmiId
+     \`\`\`
+  Do NOT do \`Parameter Type: String, Default: '{{resolve:ssm:...}}'\` — that's the failure mode. Common SSM AMI parameter paths: \`/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64\` for Amazon Linux 2023, \`/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id\` for Ubuntu 22.04.
 - **Free-tier compute on AWS** is \`t2.micro\` or \`t3.micro\` (12-month new-account free tier; 750 hours/month). Default to \`t3.micro\` for prototypes.
-- **EC2 password / SSH keys.** Don't bake passwords into UserData. Use a KeyPair (\`KeyName\` property — pre-create the key pair manually or via a separate stack) for SSH access.
+- **EC2 password / SSH keys.** Don't bake passwords into UserData. Use a KeyPair (\`KeyName\` property — pre-create the key pair manually or via a separate stack) for SSH access. **The AWS-native answer for "I need to log in" is SSM Session Manager** — attach \`AmazonSSMManagedInstanceCore\` to the instance role and you can log in via the console / aws CLI with no inbound port, no password, no key pair. Recommend SSM Session Manager whenever the user asks for "username/password" or "SSH access" — it's safer and the modern AWS pattern.
+- **SSM Session Manager prerequisites** for instances in private subnets without internet egress: either (a) interface VPC endpoints for \`ssm\`, \`ssmmessages\`, \`ec2messages\` (one set per VPC, or one in a hub VPC reachable by spokes via peering), or (b) a NAT Gateway. Endpoints with \`PrivateDnsEnabled: true\` are the cleanest pattern. Endpoint security group must allow 443 from the instance subnet CIDR.
 - **RDS DBClusterIdentifier / DBInstanceIdentifier.** 1–63 alphanumerics + hyphens, must start with letter. Same naming rules as stack names.
 - **Lambda runtime versions.** Stick to \`nodejs22.x\`, \`python3.13\`, etc. Old runtimes (e.g. \`nodejs14.x\`) get rejected.
 - **S3 bucket public-access block.** S3 buckets default to BlockPublicAcls=true on new accounts. If you need a public bucket (rare), explicitly set \`PublicAccessBlockConfiguration\`.

@@ -52,24 +52,45 @@ type Callbacks = {
 function buildPushPrompt(
   projectName: string,
   topologyId: string | null,
-  bicep: string | null
+  bicep: string | null,
+  cloud: "azure" | "aws" = "azure"
 ): string {
-  // Tags the deploy_bicep tool must enforce post-deployment. The
-  // user-approved Bicep may or may not include these — the tool's
-  // tag-enforcement step guarantees they end up on every resource so
-  // tag-filter destroy/scheduler can find them later.
   const requiredTags: Record<string, string> = {
     "mcp-project": projectName,
   };
   if (topologyId) requiredTags["mcp-topology-id"] = topologyId;
   const requiredTagsJson = JSON.stringify(requiredTags);
 
-  // Detect the multi-file convention: the user-approved Bicep may
-  // contain `// === FILE: <name>.bicep ===` separators, in which case
-  // each chunk is a separate file. The push prompt has to tell Claude
-  // to call deploy_bicep with `files` (not `bicep`) in that case.
+  // Multi-file convention is the same for both clouds — the marker
+  // `// === FILE: <name>.<ext> ===` works for .bicep and .yaml/.json.
   const isMultiFile = bicep ? /^\s*\/\/\s*===\s*FILE\s*:/m.test(bicep) : false;
 
+  if (cloud === "aws") {
+    const paramHint = isMultiFile
+      ? `\`files\` = the multi-file template below split by the \`// === FILE: <name> ===\` separators (each section becomes one entry in the files map); ` +
+        `\`entry\` = the entry-point filename (typically \`main.yaml\`); `
+      : `\`template\` = the CloudFormation template below verbatim (do NOT regenerate, rename, simplify, or modify it); `;
+
+    const head =
+      `Push the architecture to AWS now. ` +
+      `Call the \`deploy_cloudformation\` tool ONCE with these parameters: ` +
+      paramHint +
+      `\`stack_name\` = a kebab-case name for this stack (e.g. \`mcp-${projectName}-${topologyId ? topologyId.slice(0, 8) : "main"}\`); ` +
+      `\`region\` = the region the template targets (default us-east-1); ` +
+      `\`capabilities\` = pass exactly the ones the template needs (CAPABILITY_IAM if it creates IAM roles/policies, CAPABILITY_NAMED_IAM if any roles have explicit names, CAPABILITY_AUTO_EXPAND if you used transforms); ` +
+      `\`required_tags\` = ${requiredTagsJson} (CloudFormation propagates stack tags to taggable resources — pass them whether or not they're already in the template). ` +
+      `After the tool returns, inspect the result. On \`is_error: true\` or non-zero exit, emit \`<topology>\` with affected nodes' status \`failed\`. On success, emit the topology with all nodes \`success\`.`;
+
+    if (!bicep) {
+      return (
+        head +
+        "\n\n(No CloudFormation template was captured from the build. If you previously emitted one in this conversation, use that exact template. Otherwise stop and ask the user.)"
+      );
+    }
+    return head + "\n\n```\n" + bicep + "\n```";
+  }
+
+  // Azure path (default).
   const paramHint = isMultiFile
     ? `\`files\` = the multi-file template below split by the \`// === FILE: <name>.bicep ===\` separators (each section becomes one entry in the files map; the first must be \`main.bicep\`); ` +
       `\`entry\` = 'main.bicep' (default); `
@@ -95,8 +116,19 @@ function buildPushPrompt(
 
 function buildTeardownPrompt(
   projectName: string,
-  topologyId: string | null
+  topologyId: string | null,
+  cloud: "azure" | "aws" = "azure"
 ): string {
+  if (cloud === "aws") {
+    const filter = topologyId
+      ? `\`tag_filters\` = \`{ "mcp-project": "${projectName}", "mcp-topology-id": "${topologyId}" }\` (per-topology destroy)`
+      : `\`tag_filters\` = \`{ "mcp-project": "${projectName}" }\` (project-wide tear-down)`;
+    return (
+      `Tear down AWS resources for this project now. Use the \`destroy_aws\` tool with ${filter}. ` +
+      `The tool runs \`aws cloudformation delete-stack\` for matching CloudFormation stacks and waits for stack-delete-complete. ` +
+      `After the tool returns, emit \`<topology>{"nodes":[],"edges":[]}</topology>\` if it succeeded, or the prior topology with statuses set to \`failed\` if it didn't.`
+    );
+  }
   const filter = topologyId
     ? `\`tag_filters\` = \`{ "mcp-project": "${projectName}", "mcp-topology-id": "${topologyId}" }\` (per-topology destroy)`
     : `\`tag_filters\` = \`{ "mcp-project": "${projectName}" }\` (project-wide tear-down)`;
@@ -396,9 +428,9 @@ export function useChat(cb: Callbacks = {}) {
       const name = projectName ?? "<project>";
       const prompt =
         stage === "push"
-          ? buildPushPrompt(name, topologyId, bicep)
+          ? buildPushPrompt(name, topologyId, bicep, cloud)
           : stage === "teardown"
-            ? buildTeardownPrompt(name, topologyId)
+            ? buildTeardownPrompt(name, topologyId, cloud)
             : null;
       if (!prompt) return;
       // Short label for the chat view — full prompt still goes to Claude.
