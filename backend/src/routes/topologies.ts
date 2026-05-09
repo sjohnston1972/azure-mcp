@@ -16,6 +16,10 @@ import {
   repoNameForTopology,
   splitMultiFileBicep,
 } from "../lib/github.js";
+import {
+  getAzureResourceDetails,
+  getAwsResourceDetails,
+} from "../lib/resource-details.js";
 
 type Status = "draft" | "live" | "failed" | "destroyed";
 
@@ -346,6 +350,59 @@ export async function topologyRoutes(app: FastifyInstance) {
           });
         }
         throw err;
+      }
+    }
+  );
+
+  // ── Live resource details (per-node click on the canvas) ─────────
+  // Frontend sends the topology id + node id, we look up the matching
+  // live cloud resource via the topology's mcp-topology-id tag, then
+  // dispatch to the right kind-specific fetcher. Only meaningful for
+  // 'live' or 'destroyed' topologies — drafts return 404.
+  app.get<{ Params: { id: string; nodeId: string } }>(
+    "/api/topologies/:id/details/:nodeId",
+    async (req, reply) => {
+      const topoRes = await pool.query<TopologyRow>(
+        `SELECT ${TOPOLOGY_COLS} FROM topologies WHERE id = $1`,
+        [req.params.id]
+      );
+      const t = topoRes.rows[0];
+      if (!t) return reply.code(404).send({ error: "topology not found" });
+      if (t.status !== "live") {
+        return reply.code(404).send({
+          error: "topology is not live — deploy it first to see resource details",
+          status: t.status,
+        });
+      }
+      const topo = t.topology as TopologyJson | null;
+      const node = topo?.nodes.find((n) => n.id === req.params.nodeId);
+      if (!node) return reply.code(404).send({ error: "node not found in topology" });
+
+      try {
+        const details =
+          t.cloud === "aws"
+            ? await getAwsResourceDetails({
+                topologyId: t.id,
+                nodeKind: node.kind,
+                nodeLabel: node.label,
+              })
+            : await getAzureResourceDetails({
+                topologyId: t.id,
+                nodeKind: node.kind,
+                nodeLabel: node.label,
+              });
+        if (!details) {
+          return reply.code(404).send({
+            error:
+              "no live resource matched this node — check the topology was deployed cleanly",
+          });
+        }
+        return details;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return reply
+          .code(502)
+          .send({ error: "failed to fetch live resource details", detail: message });
       }
     }
   );

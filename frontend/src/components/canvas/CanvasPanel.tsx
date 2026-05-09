@@ -5,7 +5,7 @@
 // holds it, and we render. The local "Load demo" button still works
 // for offline poking.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
 import {
   Background,
   BackgroundVariant,
@@ -23,8 +23,10 @@ import {
 import "@xyflow/react/dist/style.css";
 
 import { AzureNode, type AzureNodeData } from "./AzureNode";
+import { ResourceDetailModal } from "./ResourceDetailModal";
 import { layoutNodes } from "../../lib/dagre-layout";
 import type { Topology } from "../../lib/parse-topology";
+import type { TopologyStatus } from "../../lib/types";
 
 const nodeTypes = { azure: AzureNode };
 
@@ -87,17 +89,35 @@ type Props = {
    *  loaded demo) when the user switches projects — even if both
    *  projects happen to have a null topology. */
   projectId: string | null;
+  /** Active topology id (DB row). Required for the click-to-detail
+   *  modal — the backend uses this to look up the cloud + tag scope
+   *  for the resource lookup. Null when no saved topology is active
+   *  (fresh chat, demo, etc.) — the modal will be disabled in that
+   *  case. */
+  topologyId?: string | null;
+  /** Status of the active topology. The detail modal only opens when
+   *  status === "live" (otherwise there's nothing in Azure/AWS to
+   *  inspect). */
+  topologyStatus?: TopologyStatus | null;
   /** Click handler for the example prompts in the empty state. Sends
    *  the chosen prompt as a chat turn so the canvas populates. */
   onExamplePrompt?: (prompt: string) => void;
 };
 
-export function CanvasPanel({ topology, projectId, onExamplePrompt }: Props) {
+export function CanvasPanel({
+  topology,
+  projectId,
+  topologyId,
+  topologyStatus,
+  onExamplePrompt,
+}: Props) {
   return (
     <ReactFlowProvider>
       <CanvasInner
         topology={topology}
         projectId={projectId}
+        topologyId={topologyId}
+        topologyStatus={topologyStatus}
         onExamplePrompt={onExamplePrompt}
       />
     </ReactFlowProvider>
@@ -110,7 +130,30 @@ const EXAMPLE_PROMPTS = [
   "Sketch an Azure OpenAI chat app with private endpoints",
 ];
 
-function CanvasInner({ topology, projectId, onExamplePrompt }: Props) {
+function CanvasInner({
+  topology,
+  projectId,
+  topologyId,
+  topologyStatus,
+  onExamplePrompt,
+}: Props) {
+  // Click-to-detail modal state — open it from onNodeClick when the
+  // topology is live (otherwise there's nothing in Azure/AWS to fetch).
+  const [detailNodeId, setDetailNodeId] = useState<string | null>(null);
+  const detailOpen = detailNodeId !== null;
+  const canShowDetails = Boolean(topologyId) && topologyStatus === "live";
+
+  const onNodeClick = useCallback(
+    (_e: MouseEvent, node: Node) => {
+      if (!canShowDetails) return;
+      // Only allow click-through for resources that actually deployed
+      // — pending/failed nodes don't exist in the cloud yet.
+      const status = (node.data as unknown as AzureNodeData).status;
+      if (status !== "success") return;
+      setDetailNodeId(node.id);
+    },
+    [canShowDetails]
+  );
   // When the parent passes a topology, that's the truth. The local
   // override (demo / cleared) only kicks in when there's nothing from
   // the parent. We also let the user nudge nodes around by hand —
@@ -196,6 +239,17 @@ function CanvasInner({ topology, projectId, onExamplePrompt }: Props) {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          {canShowDetails && !empty && (
+            <span
+              className="hidden md:inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant"
+              title="Click any deployed node to see live cloud-API details (IPs, NICs, SKU, …)."
+            >
+              <span className="material-symbols-outlined text-[12px]">
+                touch_app
+              </span>
+              click nodes for details
+            </span>
+          )}
           {empty ? (
             <button
               type="button"
@@ -255,6 +309,7 @@ function CanvasInner({ topology, projectId, onExamplePrompt }: Props) {
             edges={graph!.edges}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
+            onNodeClick={onNodeClick}
             nodeTypes={nodeTypes}
             fitView
             proOptions={{ hideAttribution: true }}
@@ -279,6 +334,12 @@ function CanvasInner({ topology, projectId, onExamplePrompt }: Props) {
           </ReactFlow>
         )}
       </div>
+      <ResourceDetailModal
+        open={detailOpen}
+        topologyId={topologyId ?? null}
+        nodeId={detailNodeId}
+        onClose={() => setDetailNodeId(null)}
+      />
     </section>
   );
 }

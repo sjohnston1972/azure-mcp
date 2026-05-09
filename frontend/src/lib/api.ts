@@ -228,6 +228,38 @@ export async function deleteTopology(id: string): Promise<void> {
   if (!res.ok) throw new Error(`/api/topologies/${id} → ${res.status}`);
 }
 
+/** Live resource details fetched per-click from the cloud APIs.
+ *  Mirrors the backend's ResourceDetails shape. */
+export type ResourceDetails = {
+  cloud: "azure" | "aws";
+  name: string;
+  kind: string;
+  resource_type: string;
+  location: string;
+  resource_group?: string;
+  state?: string;
+  tags?: Record<string, string>;
+  console_url?: string;
+  /** Kind-specific structured payload — modal pattern-matches on
+   *  resource_type / kind to render the right fields. */
+  props: Record<string, unknown>;
+  /** Raw cloud-API response for the modal's "Raw" tab. */
+  raw?: unknown;
+};
+
+export async function fetchResourceDetails(
+  topologyId: string,
+  nodeId: string
+): Promise<ResourceDetails> {
+  const url = `/api/topologies/${encodeURIComponent(topologyId)}/details/${encodeURIComponent(nodeId)}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`${url} → ${res.status}: ${text || res.statusText}`);
+  }
+  return res.json();
+}
+
 export type TopologyGithubPushResult = {
   ok: boolean;
   repo: string;

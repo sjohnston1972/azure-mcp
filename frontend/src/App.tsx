@@ -801,6 +801,8 @@ function AppInner() {
           <CanvasPanel
             topology={build.topology}
             projectId={current?.id ?? null}
+            topologyId={activeTopologyId}
+            topologyStatus={activeTopology?.status ?? null}
             onExamplePrompt={(text) =>
               setAutoPrompt({ text, key: Date.now() })
             }
