@@ -349,3 +349,30 @@ to fix; they're flagged here so they don't get lost.
   cookie; the header is asserted on every hop by Cloudflare.
 - **Default deploy mode = Review Bicep first** (safer first run).
   Switches per-user-preference once history exists (CLAUDE.md §4.3).
+
+---
+
+## 10. nginx must re-resolve the backend's address (fixed 12 Jun 2026)
+
+**Symptom you saw:** the tool loaded but showed no projects, and creating
+one returned a Cloudflare "502 Bad Gateway" page.
+
+**What was actually wrong:** the frontend container runs nginx, which
+forwards every `/api/*` call to the backend container by name
+(`azure-mcp-backend`). By default nginx looks that name up **once, when
+it starts**, and remembers the IP address forever. On 12 Jun the
+containers restarted overnight and the frontend came up a few seconds
+before the backend — so nginx memorised the *old* backend IP. Every API
+call then went to an address nothing was listening on, nginx returned
+502, and Cloudflare dressed it up as its own 502 page. The site HTML
+still loaded fine because that's served by nginx directly.
+
+**The fix:** `frontend/nginx.conf` now tells nginx to use Docker's
+built-in DNS server (`resolver 127.0.0.11`) and to look the backend name
+up on every request instead of caching it at startup. Container restarts
+in any order can no longer cause this.
+
+**If you ever see a Cloudflare 502 on this tool again:** first check
+`docker ps` — if the containers are up, look at
+`docker logs azure-mcp-frontend` for "connect() failed ... upstream"
+lines; that tells you exactly which hop is refusing the connection.

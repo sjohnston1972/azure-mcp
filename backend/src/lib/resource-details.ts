@@ -717,17 +717,629 @@ export async function getAzureResourceDetails(input: {
   return details;
 }
 
-// AWS path lands in the next round — placeholder so the route can
-// dispatch generically.
-export async function getAwsResourceDetails(_input: {
+// ── AWS resource lookup + fetchers ──────────────────────────────
+//
+// AWS strategy mirrors Azure but uses CloudFormation stack listing
+// as the index instead of tag-based resource search:
+//   1. Find the CFN stack by tag mcp-topology-id (or by stack name
+//      following our convention `mcp-<project>-<topo8>`).
+//   2. list-stack-resources gives every resource the stack owns,
+//      with PhysicalResourceId + ResourceType. No tag-propagation
+//      gotchas (some AWS resource types don't accept stack tags).
+//   3. Match a topology node to a stack resource by either:
+//      - Name tag (set explicitly in the template), OR
+//      - LogicalResourceId (the CFN template's resource block name).
+//   4. Per-kind describe via the appropriate aws ec2 / iam / rds CLI.
+//
+// Region: AWS is region-scoped. We default to AWS_DEFAULT_REGION
+// (env, falls back to us-east-1) since the AWS system prompt's
+// default is us-east-1. A future revision should persist the
+// region per topology row.
+
+const AWS_CLI_IMAGE = process.env.AWS_CLI_IMAGE ?? "amazon/aws-cli:latest";
+
+function awsRegion(): string {
+  return (
+    process.env.AWS_DEFAULT_REGION ?? process.env.AWS_REGION ?? "us-east-1"
+  );
+}
+
+async function awsCli<T = unknown>(args: string[]): Promise<T | null> {
+  // Same docker-socket sidecar pattern as azCli. Creds via env vars
+  // (long-lived IAM access keys for the `claude` user).
+  const shellScript = `aws ${args
+    .map((a) => `'${a.replace(/'/g, "'\\''")}'`)
+    .join(" ")} --output json`;
+
+  const dockerArgs = [
+    "run",
+    "--rm",
+    "-e",
+    `AWS_ACCESS_KEY_ID=${process.env.AWS_ACCESS_KEY_ID ?? ""}`,
+    "-e",
+    `AWS_SECRET_ACCESS_KEY=${process.env.AWS_SECRET_ACCESS_KEY ?? ""}`,
+    "-e",
+    `AWS_DEFAULT_REGION=${awsRegion()}`,
+    AWS_CLI_IMAGE,
+    "sh",
+    "-c",
+    shellScript,
+  ];
+
+  const result = await new Promise<{ code: number; stdout: string; stderr: string }>(
+    (resolve) => {
+      const child = spawn("docker", dockerArgs, {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+      child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+      const t = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }, 60_000);
+      child.on("close", (code) => {
+        clearTimeout(t);
+        resolve({ code: code ?? -1, stdout, stderr });
+      });
+      child.on("error", () => resolve({ code: -1, stdout, stderr }));
+    }
+  );
+
+  if (result.code !== 0) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[resource-details] aws command failed (${args.slice(0, 3).join(" ")}): ${result.stderr.slice(0, 300)}`
+    );
+    return null;
+  }
+  try {
+    return result.stdout.trim() ? (JSON.parse(result.stdout) as T) : (null as T | null);
+  } catch {
+    return null;
+  }
+}
+
+function awsConsoleUrl(region: string, path: string): string {
+  return `https://${region}.console.aws.amazon.com/${path}?region=${region}`;
+}
+
+type StackResource = {
+  LogicalResourceId: string;
+  PhysicalResourceId: string;
+  ResourceType: string;
+  ResourceStatus: string;
+};
+
+/** Find the CloudFormation stack for this topology and return its
+ *  resources. We try the explicit naming convention first
+ *  (mcp-<project>-<topo8>) — fast common-case — then fall back to
+ *  scanning stacks by tag if the name lookup misses. */
+async function findAwsStackResources(
+  topologyId: string
+): Promise<{ stackName: string; resources: StackResource[] } | null> {
+  // Strategy: list all stacks, find the one tagged mcp-topology-id=<id>.
+  type Stack = {
+    StackName: string;
+    Tags?: Array<{ Key: string; Value: string }>;
+  };
+  const stacks = await awsCli<{ Stacks: Stack[] }>([
+    "cloudformation",
+    "describe-stacks",
+    "--query",
+    "{Stacks:Stacks[].{StackName:StackName,Tags:Tags}}",
+  ]);
+  if (!stacks?.Stacks) return null;
+  const match = stacks.Stacks.find((s) =>
+    (s.Tags ?? []).some(
+      (t) => t.Key === "mcp-topology-id" && t.Value === topologyId
+    )
+  );
+  if (!match) return null;
+  const out = await awsCli<{ StackResourceSummaries: StackResource[] }>([
+    "cloudformation",
+    "list-stack-resources",
+    "--stack-name",
+    match.StackName,
+  ]);
+  return {
+    stackName: match.StackName,
+    resources: out?.StackResourceSummaries ?? [],
+  };
+}
+
+/** Match a topology node to a stack resource. Tries LogicalResourceId
+ *  first (most reliable since CFN owns it), then falls back to a Name
+ *  tag scan (slower — describes each candidate to read its tags). */
+function pickStackResource(
+  resources: StackResource[],
+  nodeLabel: string
+): StackResource | null {
+  const byLogicalId = resources.find((r) => r.LogicalResourceId === nodeLabel);
+  if (byLogicalId) return byLogicalId;
+  // Substring / kebab-case match — CFN logical IDs are often PascalCase
+  // while the topology labels are kebab-case ("web-01").
+  const slug = nodeLabel.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  const fuzzy = resources.find(
+    (r) => r.LogicalResourceId.replace(/[^a-z0-9]/gi, "").toLowerCase() === slug
+  );
+  return fuzzy ?? null;
+}
+
+async function fetchAwsEc2Instance(
+  id: string,
+  region: string
+): Promise<ResourceDetails | null> {
+  type Row = {
+    Reservations: Array<{
+      Instances: Array<{
+        InstanceId: string;
+        InstanceType: string;
+        ImageId: string;
+        State: { Name: string };
+        PrivateIpAddress?: string;
+        PublicIpAddress?: string;
+        SubnetId?: string;
+        VpcId?: string;
+        Architecture?: string;
+        Platform?: string;
+        PlatformDetails?: string;
+        IamInstanceProfile?: { Arn?: string };
+        SecurityGroups?: Array<{ GroupId: string; GroupName: string }>;
+        NetworkInterfaces?: Array<{
+          NetworkInterfaceId: string;
+          PrivateIpAddress?: string;
+          MacAddress?: string;
+          Association?: { PublicIp?: string };
+          Groups?: Array<{ GroupId: string; GroupName: string }>;
+        }>;
+        Tags?: Array<{ Key: string; Value: string }>;
+      }>;
+    }>;
+  };
+  const data = await awsCli<Row>(["ec2", "describe-instances", "--instance-ids", id]);
+  const inst = data?.Reservations?.[0]?.Instances?.[0];
+  if (!inst) return null;
+  const tags = Object.fromEntries((inst.Tags ?? []).map((t) => [t.Key, t.Value]));
+  const name = tags["Name"] ?? inst.InstanceId;
+  return {
+    cloud: "aws",
+    name,
+    kind: "ec2",
+    resource_type: "AWS::EC2::Instance",
+    location: region,
+    state: inst.State?.Name,
+    tags,
+    console_url: awsConsoleUrl(
+      region,
+      `ec2/home#InstanceDetails:instanceId=${inst.InstanceId}`
+    ),
+    props: {
+      instanceId: inst.InstanceId,
+      instanceType: inst.InstanceType,
+      imageId: inst.ImageId,
+      architecture: inst.Architecture,
+      platform: inst.PlatformDetails ?? inst.Platform ?? "linux",
+      privateIp: inst.PrivateIpAddress,
+      publicIp: inst.PublicIpAddress,
+      vpcId: inst.VpcId,
+      subnetId: inst.SubnetId,
+      iamInstanceProfile: inst.IamInstanceProfile?.Arn?.split("/").pop(),
+      securityGroups: (inst.SecurityGroups ?? []).map((g) => `${g.GroupId} (${g.GroupName})`),
+      networkInterfaces: (inst.NetworkInterfaces ?? []).map((n) => ({
+        id: n.NetworkInterfaceId,
+        privateIp: n.PrivateIpAddress,
+        publicIp: n.Association?.PublicIp,
+        mac: n.MacAddress,
+        sgs: (n.Groups ?? []).map((g) => g.GroupId),
+      })),
+    },
+    raw: inst,
+  };
+}
+
+async function fetchAwsVpc(
+  id: string,
+  region: string
+): Promise<ResourceDetails | null> {
+  type Vpc = {
+    VpcId: string;
+    CidrBlock: string;
+    IsDefault: boolean;
+    State: string;
+    Tags?: Array<{ Key: string; Value: string }>;
+  };
+  const data = await awsCli<{ Vpcs: Vpc[] }>([
+    "ec2",
+    "describe-vpcs",
+    "--vpc-ids",
+    id,
+  ]);
+  const v = data?.Vpcs?.[0];
+  if (!v) return null;
+  // Pull subnets + peerings + IGWs in parallel for at-a-glance summary.
+  const [subnets, peerings, igws] = await Promise.all([
+    awsCli<{ Subnets: Array<{ SubnetId: string; CidrBlock: string; AvailabilityZone: string }> }>([
+      "ec2",
+      "describe-subnets",
+      "--filters",
+      `Name=vpc-id,Values=${id}`,
+    ]),
+    awsCli<{
+      VpcPeeringConnections: Array<{
+        VpcPeeringConnectionId: string;
+        Status?: { Code?: string };
+        AccepterVpcInfo?: { VpcId?: string };
+        RequesterVpcInfo?: { VpcId?: string };
+      }>;
+    }>([
+      "ec2",
+      "describe-vpc-peering-connections",
+      "--filters",
+      `Name=accepter-vpc-info.vpc-id,Values=${id}`,
+      `Name=requester-vpc-info.vpc-id,Values=${id}`,
+    ]),
+    awsCli<{ InternetGateways: Array<{ InternetGatewayId: string }> }>([
+      "ec2",
+      "describe-internet-gateways",
+      "--filters",
+      `Name=attachment.vpc-id,Values=${id}`,
+    ]),
+  ]);
+  const tags = Object.fromEntries((v.Tags ?? []).map((t) => [t.Key, t.Value]));
+  return {
+    cloud: "aws",
+    name: tags["Name"] ?? v.VpcId,
+    kind: "vpc",
+    resource_type: "AWS::EC2::VPC",
+    location: region,
+    state: v.State,
+    tags,
+    console_url: awsConsoleUrl(region, `vpcconsole/home#VpcDetails:VpcId=${v.VpcId}`),
+    props: {
+      vpcId: v.VpcId,
+      cidr: v.CidrBlock,
+      isDefault: v.IsDefault,
+      subnets: (subnets?.Subnets ?? []).map((s) => ({
+        id: s.SubnetId,
+        cidr: s.CidrBlock,
+        az: s.AvailabilityZone,
+      })),
+      peerings: (peerings?.VpcPeeringConnections ?? []).map((p) => ({
+        id: p.VpcPeeringConnectionId,
+        state: p.Status?.Code,
+        accepter: p.AccepterVpcInfo?.VpcId,
+        requester: p.RequesterVpcInfo?.VpcId,
+      })),
+      internetGateways: (igws?.InternetGateways ?? []).map((g) => g.InternetGatewayId),
+    },
+    raw: v,
+  };
+}
+
+async function fetchAwsSubnet(
+  id: string,
+  region: string
+): Promise<ResourceDetails | null> {
+  type Subnet = {
+    SubnetId: string;
+    VpcId: string;
+    CidrBlock: string;
+    AvailabilityZone: string;
+    AvailableIpAddressCount: number;
+    MapPublicIpOnLaunch: boolean;
+    State: string;
+    Tags?: Array<{ Key: string; Value: string }>;
+  };
+  const data = await awsCli<{ Subnets: Subnet[] }>([
+    "ec2",
+    "describe-subnets",
+    "--subnet-ids",
+    id,
+  ]);
+  const s = data?.Subnets?.[0];
+  if (!s) return null;
+  const tags = Object.fromEntries((s.Tags ?? []).map((t) => [t.Key, t.Value]));
+  return {
+    cloud: "aws",
+    name: tags["Name"] ?? s.SubnetId,
+    kind: "subnet",
+    resource_type: "AWS::EC2::Subnet",
+    location: region,
+    state: s.State,
+    tags,
+    console_url: awsConsoleUrl(region, `vpcconsole/home#SubnetDetails:subnetId=${s.SubnetId}`),
+    props: {
+      subnetId: s.SubnetId,
+      vpcId: s.VpcId,
+      cidr: s.CidrBlock,
+      az: s.AvailabilityZone,
+      availableIps: s.AvailableIpAddressCount,
+      publicOnLaunch: s.MapPublicIpOnLaunch,
+    },
+    raw: s,
+  };
+}
+
+async function fetchAwsSecurityGroup(
+  id: string,
+  region: string
+): Promise<ResourceDetails | null> {
+  type Sg = {
+    GroupId: string;
+    GroupName: string;
+    VpcId: string;
+    Description: string;
+    IpPermissions?: Array<{
+      IpProtocol: string;
+      FromPort?: number;
+      ToPort?: number;
+      IpRanges?: Array<{ CidrIp: string }>;
+      UserIdGroupPairs?: Array<{ GroupId: string }>;
+    }>;
+    IpPermissionsEgress?: Array<{ IpProtocol: string }>;
+    Tags?: Array<{ Key: string; Value: string }>;
+  };
+  const data = await awsCli<{ SecurityGroups: Sg[] }>([
+    "ec2",
+    "describe-security-groups",
+    "--group-ids",
+    id,
+  ]);
+  const sg = data?.SecurityGroups?.[0];
+  if (!sg) return null;
+  const tags = Object.fromEntries((sg.Tags ?? []).map((t) => [t.Key, t.Value]));
+  return {
+    cloud: "aws",
+    name: tags["Name"] ?? sg.GroupName,
+    kind: "security-group",
+    resource_type: "AWS::EC2::SecurityGroup",
+    location: region,
+    tags,
+    console_url: awsConsoleUrl(
+      region,
+      `vpcconsole/home#SecurityGroup:groupId=${sg.GroupId}`
+    ),
+    props: {
+      groupId: sg.GroupId,
+      groupName: sg.GroupName,
+      vpcId: sg.VpcId,
+      description: sg.Description,
+      ingress: (sg.IpPermissions ?? []).map((p) => ({
+        protocol: p.IpProtocol,
+        from: p.FromPort,
+        to: p.ToPort,
+        cidrs: (p.IpRanges ?? []).map((r) => r.CidrIp),
+        sgs: (p.UserIdGroupPairs ?? []).map((g) => g.GroupId),
+      })),
+      egressCount: (sg.IpPermissionsEgress ?? []).length,
+    },
+    raw: sg,
+  };
+}
+
+async function fetchAwsIamRole(
+  name: string,
+  region: string
+): Promise<ResourceDetails | null> {
+  type Role = {
+    RoleName: string;
+    Arn: string;
+    Path: string;
+    CreateDate: string;
+    AssumeRolePolicyDocument: string;
+  };
+  const data = await awsCli<{ Role: Role }>([
+    "iam",
+    "get-role",
+    "--role-name",
+    name,
+  ]);
+  if (!data?.Role) return null;
+  // Attached managed policies — most useful at a glance for SSM roles.
+  const policies = await awsCli<{
+    AttachedPolicies: Array<{ PolicyName: string; PolicyArn: string }>;
+  }>(["iam", "list-attached-role-policies", "--role-name", name]);
+  return {
+    cloud: "aws",
+    name: data.Role.RoleName,
+    kind: "iam-role",
+    resource_type: "AWS::IAM::Role",
+    location: "global",
+    console_url: awsConsoleUrl(region, `iamv2/home#/roles/details/${name}`),
+    props: {
+      arn: data.Role.Arn,
+      path: data.Role.Path,
+      attachedPolicies: (policies?.AttachedPolicies ?? []).map((p) => p.PolicyName),
+    },
+    raw: data.Role,
+  };
+}
+
+async function fetchAwsVpcEndpoint(
+  id: string,
+  region: string
+): Promise<ResourceDetails | null> {
+  type Ep = {
+    VpcEndpointId: string;
+    VpcEndpointType: string;
+    VpcId: string;
+    ServiceName: string;
+    State: string;
+    SubnetIds?: string[];
+    PrivateDnsEnabled?: boolean;
+    Tags?: Array<{ Key: string; Value: string }>;
+  };
+  const data = await awsCli<{ VpcEndpoints: Ep[] }>([
+    "ec2",
+    "describe-vpc-endpoints",
+    "--vpc-endpoint-ids",
+    id,
+  ]);
+  const e = data?.VpcEndpoints?.[0];
+  if (!e) return null;
+  const tags = Object.fromEntries((e.Tags ?? []).map((t) => [t.Key, t.Value]));
+  return {
+    cloud: "aws",
+    name: tags["Name"] ?? e.VpcEndpointId,
+    kind: "vpc-endpoint",
+    resource_type: "AWS::EC2::VPCEndpoint",
+    location: region,
+    state: e.State,
+    tags,
+    console_url: awsConsoleUrl(
+      region,
+      `vpcconsole/home#EndpointDetails:vpcEndpointId=${e.VpcEndpointId}`
+    ),
+    props: {
+      endpointId: e.VpcEndpointId,
+      type: e.VpcEndpointType,
+      vpcId: e.VpcId,
+      service: e.ServiceName,
+      privateDns: e.PrivateDnsEnabled,
+      subnetIds: e.SubnetIds ?? [],
+    },
+    raw: e,
+  };
+}
+
+async function fetchAwsCfnStack(
+  stackName: string,
+  region: string
+): Promise<ResourceDetails | null> {
+  type Stack = {
+    StackName: string;
+    StackId: string;
+    StackStatus: string;
+    CreationTime: string;
+    Tags?: Array<{ Key: string; Value: string }>;
+  };
+  const data = await awsCli<{ Stacks: Stack[] }>([
+    "cloudformation",
+    "describe-stacks",
+    "--stack-name",
+    stackName,
+  ]);
+  const s = data?.Stacks?.[0];
+  if (!s) return null;
+  const resList = await awsCli<{ StackResourceSummaries: StackResource[] }>([
+    "cloudformation",
+    "list-stack-resources",
+    "--stack-name",
+    stackName,
+  ]);
+  const byType: Record<string, number> = {};
+  for (const r of resList?.StackResourceSummaries ?? []) {
+    byType[r.ResourceType] = (byType[r.ResourceType] ?? 0) + 1;
+  }
+  const tags = Object.fromEntries((s.Tags ?? []).map((t) => [t.Key, t.Value]));
+  return {
+    cloud: "aws",
+    name: s.StackName,
+    kind: "cloudformation-stack",
+    resource_type: "AWS::CloudFormation::Stack",
+    location: region,
+    state: s.StackStatus,
+    tags,
+    console_url: awsConsoleUrl(
+      region,
+      `cloudformation/home#/stacks/stackinfo?stackId=${encodeURIComponent(s.StackId)}`
+    ),
+    props: {
+      stackName: s.StackName,
+      createdAt: s.CreationTime,
+      resourceCount: resList?.StackResourceSummaries?.length ?? 0,
+      byType,
+    },
+    raw: s,
+  };
+}
+
+async function fetchAwsGeneric(
+  resource: StackResource,
+  region: string
+): Promise<ResourceDetails | null> {
+  return {
+    cloud: "aws",
+    name: resource.PhysicalResourceId,
+    kind: "generic",
+    resource_type: resource.ResourceType,
+    location: region,
+    state: resource.ResourceStatus,
+    console_url: awsConsoleUrl(region, ""),
+    props: {
+      logicalId: resource.LogicalResourceId,
+      physicalId: resource.PhysicalResourceId,
+    },
+    raw: resource,
+  };
+}
+
+export async function getAwsResourceDetails(input: {
   topologyId: string;
   nodeKind: string;
   nodeLabel: string;
   force?: boolean;
 }): Promise<ResourceDetails | null> {
-  // TODO(aws): tag-resource-groups-api lookup + per-kind fetchers
-  // for EC2, RDS, NAT GW, S3.
-  return null;
+  const cacheKey = `aws:${input.topologyId}:${input.nodeKind}:${input.nodeLabel}`;
+  if (!input.force) {
+    const cached = cacheGet(cacheKey);
+    if (cached !== undefined) return cached;
+  }
+
+  const region = awsRegion();
+  const stack = await findAwsStackResources(input.topologyId);
+  if (!stack) {
+    cacheSet(cacheKey, null);
+    return null;
+  }
+
+  // Special-case the CFN stack itself when the topology has a stack
+  // node (we use kind 'cloudformation-stack' or 'resource-group' as
+  // a stack analog).
+  if (
+    input.nodeKind === "cloudformation-stack" ||
+    input.nodeKind === "resource-group" ||
+    input.nodeLabel === stack.stackName
+  ) {
+    const details = await fetchAwsCfnStack(stack.stackName, region);
+    cacheSet(cacheKey, details);
+    return details;
+  }
+
+  const match = pickStackResource(stack.resources, input.nodeLabel);
+  if (!match) {
+    cacheSet(cacheKey, null);
+    return null;
+  }
+
+  let details: ResourceDetails | null = null;
+  switch (match.ResourceType) {
+    case "AWS::EC2::Instance":
+      details = await fetchAwsEc2Instance(match.PhysicalResourceId, region);
+      break;
+    case "AWS::EC2::VPC":
+      details = await fetchAwsVpc(match.PhysicalResourceId, region);
+      break;
+    case "AWS::EC2::Subnet":
+      details = await fetchAwsSubnet(match.PhysicalResourceId, region);
+      break;
+    case "AWS::EC2::SecurityGroup":
+      details = await fetchAwsSecurityGroup(match.PhysicalResourceId, region);
+      break;
+    case "AWS::EC2::VPCEndpoint":
+      details = await fetchAwsVpcEndpoint(match.PhysicalResourceId, region);
+      break;
+    case "AWS::IAM::Role":
+      details = await fetchAwsIamRole(match.PhysicalResourceId, region);
+      break;
+    default:
+      details = await fetchAwsGeneric(match, region);
+  }
+  cacheSet(cacheKey, details);
+  return details;
 }
 
 // ── Bulk prefetch (post-deploy DB cache) ────────────────────────

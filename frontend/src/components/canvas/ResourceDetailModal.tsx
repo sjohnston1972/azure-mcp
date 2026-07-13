@@ -233,6 +233,7 @@ function stateChipClass(state: string): string {
 
 function DetailsView({ d }: { d: ResourceDetails }) {
   switch (d.resource_type) {
+    // Azure
     case "Microsoft.Compute/virtualMachines":
       return <VmDetails d={d} />;
     case "Microsoft.Network/bastionHosts":
@@ -247,6 +248,21 @@ function DetailsView({ d }: { d: ResourceDetails }) {
       return <StorageDetails d={d} />;
     case "Microsoft.Sql/servers":
       return <SqlServerDetails d={d} />;
+    // AWS
+    case "AWS::EC2::Instance":
+      return <Ec2Details d={d} />;
+    case "AWS::EC2::VPC":
+      return <VpcDetails d={d} />;
+    case "AWS::EC2::Subnet":
+      return <AwsSubnetDetails d={d} />;
+    case "AWS::EC2::SecurityGroup":
+      return <SecurityGroupDetails d={d} />;
+    case "AWS::EC2::VPCEndpoint":
+      return <VpcEndpointDetails d={d} />;
+    case "AWS::IAM::Role":
+      return <IamRoleDetails d={d} />;
+    case "AWS::CloudFormation::Stack":
+      return <CfnStackDetails d={d} />;
     default:
       return <GenericDetails d={d} />;
   }
@@ -664,6 +680,280 @@ function ResourceGroupDetails({ d }: { d: ResourceDetails }) {
     <>
       <Section title="Resource group">
         <Field label="Location" value={d.location} />
+        <Field label="State" value={d.state} />
+        <Field label="Total resources" value={p.resourceCount ?? 0} />
+      </Section>
+      {p.byType && Object.keys(p.byType).length > 0 && (
+        <Section title="Resources by type">
+          <div className="space-y-1">
+            {Object.entries(p.byType)
+              .sort((a, b) => b[1] - a[1])
+              .map(([type, count]) => (
+                <div
+                  key={type}
+                  className="text-sm flex items-center justify-between gap-2 py-0.5"
+                >
+                  <code className="font-mono text-xs">{type}</code>
+                  <span className="text-xs text-on-surface-variant">{count}</span>
+                </div>
+              ))}
+          </div>
+        </Section>
+      )}
+    </>
+  );
+}
+
+// ── AWS-side detail layouts ─────────────────────────────────────
+
+function Ec2Details({ d }: { d: ResourceDetails }) {
+  const p = d.props as {
+    instanceId?: string;
+    instanceType?: string;
+    imageId?: string;
+    architecture?: string;
+    platform?: string;
+    privateIp?: string;
+    publicIp?: string;
+    vpcId?: string;
+    subnetId?: string;
+    iamInstanceProfile?: string;
+    securityGroups?: string[];
+    networkInterfaces?: Array<{
+      id: string;
+      privateIp?: string;
+      publicIp?: string;
+      mac?: string;
+      sgs?: string[];
+    }>;
+  };
+  return (
+    <>
+      <Section title="Compute">
+        <Field label="Instance" value={<code className="font-mono">{p.instanceId}</code>} />
+        <Field label="Type" value={<code className="font-mono">{p.instanceType}</code>} />
+        <Field label="AMI" value={<code className="font-mono text-xs">{p.imageId}</code>} />
+        <Field label="Arch" value={p.architecture} />
+        <Field label="Platform" value={p.platform} />
+        <Field
+          label="IAM profile"
+          value={p.iamInstanceProfile ? <code className="font-mono">{p.iamInstanceProfile}</code> : "—"}
+        />
+      </Section>
+      <Section title="Network">
+        <Field label="VPC" value={<code className="font-mono">{p.vpcId}</code>} />
+        <Field label="Subnet" value={<code className="font-mono">{p.subnetId}</code>} />
+        <Field label="Private IP" value={<code className="font-mono">{p.privateIp}</code>} />
+        {p.publicIp && <Field label="Public IP" value={<code className="font-mono">{p.publicIp}</code>} />}
+        <Field
+          label="Security groups"
+          value={(p.securityGroups ?? []).map((s) => (
+            <code key={s} className="font-mono mr-2 text-xs">{s}</code>
+          ))}
+        />
+        {p.networkInterfaces && p.networkInterfaces.length > 0 && (
+          <div className="mt-2 space-y-1">
+            {p.networkInterfaces.map((n) => (
+              <div key={n.id} className="text-xs flex items-center gap-2">
+                <code className="font-mono">{n.id}</code>
+                {n.mac && <span className="text-on-surface-variant">{n.mac}</span>}
+                {n.privateIp && <code className="font-mono">{n.privateIp}</code>}
+                {n.publicIp && <code className="font-mono text-tertiary">{n.publicIp}</code>}
+              </div>
+            ))}
+          </div>
+        )}
+      </Section>
+    </>
+  );
+}
+
+function VpcDetails({ d }: { d: ResourceDetails }) {
+  const p = d.props as {
+    vpcId?: string;
+    cidr?: string;
+    isDefault?: boolean;
+    subnets?: Array<{ id: string; cidr: string; az: string }>;
+    peerings?: Array<{ id: string; state?: string; accepter?: string; requester?: string }>;
+    internetGateways?: string[];
+  };
+  return (
+    <>
+      <Section title="VPC">
+        <Field label="VPC ID" value={<code className="font-mono">{p.vpcId}</code>} />
+        <Field label="CIDR" value={<code className="font-mono">{p.cidr}</code>} />
+        <Field label="Default" value={p.isDefault ? "yes" : "no"} />
+        {p.internetGateways && p.internetGateways.length > 0 && (
+          <Field
+            label="IGWs"
+            value={p.internetGateways.map((g) => (
+              <code key={g} className="font-mono mr-2 text-xs">{g}</code>
+            ))}
+          />
+        )}
+      </Section>
+      {p.subnets && p.subnets.length > 0 && (
+        <Section title={`Subnets (${p.subnets.length})`}>
+          <div className="space-y-1">
+            {p.subnets.map((s) => (
+              <div key={s.id} className="text-sm flex items-center justify-between gap-2 py-0.5">
+                <code className="font-mono text-xs">{s.id}</code>
+                <span className="text-xs text-on-surface-variant">
+                  {s.cidr} · {s.az}
+                </span>
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
+      {p.peerings && p.peerings.length > 0 && (
+        <Section title={`Peerings (${p.peerings.length})`}>
+          <div className="space-y-1">
+            {p.peerings.map((pe) => (
+              <div key={pe.id} className="text-sm flex items-center justify-between gap-2 py-0.5">
+                <code className="font-mono text-xs">{pe.id}</code>
+                <span className="text-xs text-on-surface-variant">
+                  {pe.accepter} ↔ {pe.requester} · {pe.state}
+                </span>
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
+    </>
+  );
+}
+
+function AwsSubnetDetails({ d }: { d: ResourceDetails }) {
+  const p = d.props as {
+    subnetId?: string;
+    vpcId?: string;
+    cidr?: string;
+    az?: string;
+    availableIps?: number;
+    publicOnLaunch?: boolean;
+  };
+  return (
+    <Section title="Subnet">
+      <Field label="Subnet ID" value={<code className="font-mono">{p.subnetId}</code>} />
+      <Field label="VPC" value={<code className="font-mono">{p.vpcId}</code>} />
+      <Field label="CIDR" value={<code className="font-mono">{p.cidr}</code>} />
+      <Field label="AZ" value={p.az} />
+      <Field label="Available IPs" value={p.availableIps} />
+      <Field label="Public on launch" value={p.publicOnLaunch ? "yes" : "no"} />
+    </Section>
+  );
+}
+
+function SecurityGroupDetails({ d }: { d: ResourceDetails }) {
+  const p = d.props as {
+    groupId?: string;
+    groupName?: string;
+    vpcId?: string;
+    description?: string;
+    ingress?: Array<{
+      protocol: string;
+      from?: number;
+      to?: number;
+      cidrs: string[];
+      sgs: string[];
+    }>;
+    egressCount?: number;
+  };
+  return (
+    <>
+      <Section title="Security group">
+        <Field label="Group ID" value={<code className="font-mono">{p.groupId}</code>} />
+        <Field label="Name" value={<code className="font-mono">{p.groupName}</code>} />
+        <Field label="VPC" value={<code className="font-mono">{p.vpcId}</code>} />
+        <Field label="Description" value={p.description} />
+        <Field label="Egress rules" value={p.egressCount ?? 0} />
+      </Section>
+      {p.ingress && p.ingress.length > 0 && (
+        <Section title={`Ingress rules (${p.ingress.length})`}>
+          <div className="space-y-1">
+            {p.ingress.map((r, i) => (
+              <div key={i} className="text-xs flex items-center justify-between gap-2 py-0.5">
+                <code className="font-mono">
+                  {r.protocol === "-1" ? "all" : r.protocol}
+                  {r.from !== undefined && `:${r.from}${r.to !== r.from ? `-${r.to}` : ""}`}
+                </code>
+                <span className="text-on-surface-variant">
+                  {[...r.cidrs, ...r.sgs].join(", ") || "—"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
+    </>
+  );
+}
+
+function VpcEndpointDetails({ d }: { d: ResourceDetails }) {
+  const p = d.props as {
+    endpointId?: string;
+    type?: string;
+    vpcId?: string;
+    service?: string;
+    privateDns?: boolean;
+    subnetIds?: string[];
+  };
+  return (
+    <Section title="VPC endpoint">
+      <Field label="Endpoint ID" value={<code className="font-mono">{p.endpointId}</code>} />
+      <Field label="Type" value={p.type} />
+      <Field label="VPC" value={<code className="font-mono">{p.vpcId}</code>} />
+      <Field label="Service" value={<code className="font-mono text-xs">{p.service}</code>} />
+      <Field label="Private DNS" value={p.privateDns ? "yes" : "no"} />
+      {p.subnetIds && p.subnetIds.length > 0 && (
+        <Field
+          label="Subnets"
+          value={p.subnetIds.map((s) => (
+            <code key={s} className="font-mono mr-2 text-xs">{s}</code>
+          ))}
+        />
+      )}
+    </Section>
+  );
+}
+
+function IamRoleDetails({ d }: { d: ResourceDetails }) {
+  const p = d.props as {
+    arn?: string;
+    path?: string;
+    attachedPolicies?: string[];
+  };
+  return (
+    <Section title="IAM role">
+      <Field label="ARN" value={<code className="font-mono text-xs">{p.arn}</code>} />
+      <Field label="Path" value={<code className="font-mono">{p.path}</code>} />
+      <Field
+        label="Attached policies"
+        value={
+          p.attachedPolicies && p.attachedPolicies.length > 0
+            ? p.attachedPolicies.map((s) => (
+                <code key={s} className="font-mono mr-2 text-xs">{s}</code>
+              ))
+            : "—"
+        }
+      />
+    </Section>
+  );
+}
+
+function CfnStackDetails({ d }: { d: ResourceDetails }) {
+  const p = d.props as {
+    stackName?: string;
+    createdAt?: string;
+    resourceCount?: number;
+    byType?: Record<string, number>;
+  };
+  return (
+    <>
+      <Section title="CloudFormation stack">
+        <Field label="Stack" value={<code className="font-mono">{p.stackName}</code>} />
+        <Field label="Created" value={p.createdAt} />
         <Field label="State" value={d.state} />
         <Field label="Total resources" value={p.resourceCount ?? 0} />
       </Section>

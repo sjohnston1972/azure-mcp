@@ -287,13 +287,27 @@ function AppInner() {
       });
       if (!ok) return;
       try {
+        // Reset every node's status to "planned" — the saved canvas
+        // captures the source deployment's state (typically "success"
+        // → "deployed" pill), but in this new project nothing has been
+        // pushed yet. Without this, a freshly-loaded template lights
+        // up green as if it were already live.
+        const freshTopology = t.topology
+          ? {
+              ...t.topology,
+              nodes: t.topology.nodes.map((n) => ({
+                ...n,
+                status: "planned" as const,
+              })),
+            }
+          : null;
         const created = await createTopology({
           project_id: current.id,
           name: t.name.slice(0, 24),
           bicep: t.bicep,
           // Pass through the saved canvas if present so the new
           // topology row lands with both bicep and topology JSON.
-          ...(t.topology ? { topology: t.topology } : {}),
+          ...(freshTopology ? { topology: freshTopology } : {}),
         });
         setTopologies((cur) => [created, ...cur]);
         setActiveTopologyId(created.id);
