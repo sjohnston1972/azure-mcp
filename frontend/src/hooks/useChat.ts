@@ -134,8 +134,11 @@ function buildTeardownPrompt(
     : `\`tag_filters\` = \`{ "mcp-project": "${projectName}" }\` (project-wide tear-down)`;
   return (
     `Tear down Azure resources for this project now. Use the \`destroy_azure\` tool with ${filter}. ` +
-    `The tool runs \`az group delete\` for matching resource groups and \`az resource delete\` for any standalone matches, then waits for completion. ` +
-    `After the tool returns, emit \`<topology>{"nodes":[],"edges":[]}</topology>\` if it succeeded, or the prior topology with statuses set to \`failed\` if it didn't.`
+    `It is a two-step call: call it FIRST without \`confirm\` to get the dry-run list of what would be deleted. ` +
+    `Check that list — every entry should carry this project's tag. If it does, call the tool AGAIN with the identical arguments plus \`confirm: true\` to perform the deletion. ` +
+    `If the dry run shows anything unexpected, or is refused, do NOT confirm — report what it returned and stop. ` +
+    `The confirmed run does \`az group delete\` for matching resource groups and \`az resource delete\` for standalone matches, then waits for completion. ` +
+    `After the confirmed run returns, emit \`<topology>{"nodes":[],"edges":[]}</topology>\` if it succeeded, or the prior topology with statuses set to \`failed\` if it didn't.`
   );
 }
 
@@ -203,7 +206,24 @@ export function useChat(cb: Callbacks = {}) {
       type ToolOutcome =
         | { resolved: false }
         | { resolved: true; isError: boolean };
-      const toolResults: { id: string; name: string; outcome: ToolOutcome }[] = [];
+      // `input` is kept because destroy_azure is a two-step call: the
+      // first invocation is a dry run that deletes nothing. Only a call
+      // carrying `confirm: true` actually removed anything, so only that
+      // one may flip the topology row to "destroyed".
+      const toolResults: {
+        id: string;
+        name: string;
+        input: unknown;
+        outcome: ToolOutcome;
+      }[] = [];
+
+      /** True for a destroy_azure call that actually performed deletions
+       *  (as opposed to the dry-run half of the plan-then-confirm flow). */
+      const isConfirmedDestroy = (t: { name: string; input: unknown }) =>
+        t.name === "destroy_azure" &&
+        typeof t.input === "object" &&
+        t.input !== null &&
+        (t.input as { confirm?: unknown }).confirm === true;
 
       const updateAssistant = (
         mut: (blocks: AssistantBlock[]) => AssistantBlock[]
@@ -231,9 +251,7 @@ export function useChat(cb: Callbacks = {}) {
         const lastDeploy = [...toolResults]
           .reverse()
           .find((tr) => tr.name === "deploy_bicep");
-        const lastDestroy = [...toolResults]
-          .reverse()
-          .find((tr) => tr.name === "destroy_azure");
+        const lastDestroy = [...toolResults].reverse().find(isConfirmedDestroy);
         const statusFor = (tool: typeof lastDeploy): ToolStatus => {
           if (!tool) return null;
           if (!tool.outcome.resolved) return "incomplete";
@@ -292,7 +310,7 @@ export function useChat(cb: Callbacks = {}) {
             };
             // Pre-record at tool_use time. Outcome stays unresolved
             // until the matching tool_result event arrives.
-            toolResults.push({ id, name, outcome: { resolved: false } });
+            toolResults.push({ id, name, input, outcome: { resolved: false } });
             updateAssistant((blocks) => [
               ...blocks,
               {
@@ -345,9 +363,7 @@ export function useChat(cb: Callbacks = {}) {
             //     deployment may still be running on Azure's side
             const lastInteresting = [...toolResults]
               .reverse()
-              .find(
-                (t) => t.name === "deploy_bicep" || t.name === "destroy_azure"
-              );
+              .find((t) => t.name === "deploy_bicep" || isConfirmedDestroy(t));
             if (
               lastInteresting?.outcome.resolved === true &&
               !lastInteresting.outcome.isError

@@ -6,6 +6,7 @@
 import type { FastifyInstance } from "fastify";
 import { getMcpClient } from "../mcp/client.js";
 import { getClaudeTools } from "../claude/tool-bridge.js";
+import type { ChatStage } from "../claude/tool-stages.js";
 
 export async function mcpRoutes(app: FastifyInstance) {
   // GET /api/mcp/tools
@@ -13,7 +14,7 @@ export async function mcpRoutes(app: FastifyInstance) {
   // MCP Server tools plus our in-process custom tools (deploy_bicep,
   // etc). Use /api/mcp/tools?upstream=true to see only the MCP server's
   // tools (without our additions).
-  app.get<{ Querystring: { upstream?: string; cloud?: string } }>(
+  app.get<{ Querystring: { upstream?: string; cloud?: string; stage?: string } }>(
     "/api/mcp/tools",
     async (req) => {
       if (req.query.upstream === "true") {
@@ -32,9 +33,19 @@ export async function mcpRoutes(app: FastifyInstance) {
       // to see the AWS-side tool list.
       const cloud =
         req.query.cloud === "aws" ? "aws" : ("azure" as "azure" | "aws");
-      const tools = await getClaudeTools(cloud);
+      // The list Claude sees depends on the lifecycle stage — mutating
+      // tools are withheld in read-only stages. Pass ?stage=push (or
+      // teardown/view/free) to inspect a specific stage's list; the
+      // default mirrors a fresh chat turn.
+      const stage: ChatStage = (
+        ["build", "view", "push", "teardown", "free"] as ChatStage[]
+      ).includes(req.query.stage as ChatStage)
+        ? (req.query.stage as ChatStage)
+        : "build";
+      const tools = await getClaudeTools(cloud, stage);
       return {
         cloud,
+        stage,
         count: tools.length,
         tools: tools.map((t) => ({
           name: t.name,

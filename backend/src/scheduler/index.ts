@@ -16,6 +16,7 @@ import { pool } from "../db/pool.js";
 import { anthropic } from "../claude/client.js";
 import { SYSTEM_PROMPT } from "../claude/system-prompt.js";
 import { callMcpTool, getClaudeTools } from "../claude/tool-bridge.js";
+import type { ChatStage } from "../claude/tool-stages.js";
 import { config } from "../config.js";
 
 type ScheduleRow = {
@@ -36,9 +37,20 @@ const MAX_TURNS = 25;
 
 function stageGuard(action: "push" | "teardown"): string {
   if (action === "push") {
-    return "## Active stage: PUSH (scheduled)\n\nDeploy the architecture described by the Bicep below. Tag every resource with `azure-mcp-project=<project name>`. Emit an updated `<topology>` marker reflecting actual outcome.";
+    // NOTE: the tag key is `mcp-project`, NOT `azure-mcp-project`. Some
+    // Azure resource providers reject the `azure-` prefix on user tags, so
+    // the whole tool standardised on `mcp-`. The interactive chat path has
+    // always used `mcp-`; the scheduler used to say `azure-mcp-` here,
+    // which meant scheduled deploys were tagged with a key the teardown
+    // flow never queries.
+    return "## Active stage: PUSH (scheduled)\n\nDeploy the architecture described by the Bicep below. Tag every resource with `mcp-project=<project name>`. Emit an updated `<topology>` marker reflecting actual outcome.";
   }
-  return "## Active stage: TEAR-DOWN (scheduled)\n\nDelete every Azure resource tagged with `azure-mcp-project=<project name>`. Typically: list resource groups carrying that tag and delete each (cascades). After teardown, emit `<topology>{\"nodes\":[],\"edges\":[]}</topology>`.";
+  // Scheduled runs are headless — nobody is watching to approve the plan,
+  // so the model must do both halves of the dry-run/confirm sequence
+  // itself. The dry run still earns its keep: it lands in the tool-call
+  // trail written to the deployments table, and the safety cap and
+  // project-anchor guard still refuse an over-broad filter.
+  return "## Active stage: TEAR-DOWN (scheduled)\n\nDelete every Azure resource tagged with `mcp-project=<project name>` using the `destroy_azure` tool. It is a two-step call: first WITHOUT `confirm` to get the dry-run list of what would be deleted, then — if the list contains only resources carrying this project's tag — call again with the identical arguments plus `confirm: true`. If the dry run returns an error, a refusal, or resources you did not expect, do NOT confirm; report what you saw instead. After teardown, emit `<topology>{\"nodes\":[],\"edges\":[]}</topology>`.";
 }
 
 async function runScheduleOnce(
@@ -77,22 +89,27 @@ async function runScheduleOnce(
   // Build the user-turn message.
   const userMessage =
     schedule.action === "push"
-      ? `Deploy this Bicep template now to project '${project.name}'. Tag every resource with azure-mcp-project=${project.name}. Bicep:\n\n\`\`\`bicep\n${templateBicep}\n\`\`\``
-      : `Tear down all Azure resources tagged with azure-mcp-project=${project.name}. Find them via the MCP tools and delete them.`;
+      ? `Deploy this Bicep template now to project '${project.name}'. Pass required_tags = { "mcp-project": "${project.name}" } to deploy_bicep so every resource carries the project tag. Bicep:\n\n\`\`\`bicep\n${templateBicep}\n\`\`\``
+      : `Tear down all Azure resources for project '${project.name}'. Call destroy_azure with tag_filters = { "mcp-project": "${project.name}" } — dry run first, then confirm.`;
 
   const systemBlocks: Anthropic.TextBlockParam[] = [
     { type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
     { type: "text", text: stageGuard(schedule.action) },
     {
       type: "text",
-      text: `## Active project\n\nThe scheduler is running on behalf of project '${project.name}'.\nTag every Azure resource with azure-mcp-project=${project.name}.`,
+      text: `## Active project\n\nThe scheduler is running on behalf of project '${project.name}'.\nTag every Azure resource with mcp-project=${project.name} (exact key — the destroy and scheduler flows query this string verbatim).`,
     },
   ];
 
   // Scheduler only runs Azure templates today (templates table doesn't
   // carry a cloud field). Hardcoded — if/when AWS templates get
   // scheduling, look up cloud from the saved template's source.
-  const tools = await getClaudeTools("azure");
+  //
+  // The schedule's action IS the lifecycle stage: a push schedule gets
+  // deploy tools only, a teardown schedule gets destroy tools only. Same
+  // rule the interactive chat runs under.
+  const stage: ChatStage = schedule.action;
+  const tools = await getClaudeTools("azure", stage);
   const messages: Anthropic.MessageParam[] = [
     { role: "user", content: userMessage },
   ];
@@ -130,7 +147,7 @@ async function runScheduleOnce(
     );
     const toolResults: Anthropic.ToolResultBlockParam[] = [];
     for (const t of toolUses) {
-      const r = await callMcpTool(t.name, t.input);
+      const r = await callMcpTool(t.name, t.input, stage);
       toolCallTrail.push({
         name: t.name,
         input: t.input,

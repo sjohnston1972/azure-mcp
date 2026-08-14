@@ -376,3 +376,166 @@ in any order can no longer cause this.
 `docker ps` — if the containers are up, look at
 `docker logs azure-mcp-frontend` for "connect() failed ... upstream"
 lines; that tells you exactly which hop is refusing the connection.
+
+---
+
+## 11. Security hardening pass (14 Aug 2026) — GitHub issues #1–#13
+
+A security review raised thirteen issues against the deploy/destroy path.
+They were really four problems, each with its own remediation steps. This
+section records what changed and, more usefully, *why the shape of the fix
+is what it is* — so a future change doesn't quietly undo it.
+
+### 11.1 Data must never become code (#1–#4)
+
+**The problem.** Every deploy/destroy tool worked by pasting values into a
+shell script string and running it via `docker run ... sh -c "<script>"`
+inside a container holding live cloud credentials. A resource group named
+`x"; az ad sp create-for-rbac --role Owner; echo "` would break out of the
+quoting and run as a command. Those values come from Claude's tool calls,
+and in an agentic loop the model's arguments are shaped by text nobody
+vetted — existing resource names, tags, MCP tool output, error messages.
+So a prompt-injection payload buried in any of that could reach a shell.
+
+**The fix, in two layers.**
+
+1. **Structural (the real one).** Nothing dynamic is written into the
+   script text any more. The script bodies are static and only ever say
+   `"$DEPLOY_RG"`, `"$DESTROY_JMES_GROUPS"`, and so on; the values ride
+   along as `docker run -e NAME=value` flags. Docker hands those to the
+   container without any shell parsing, and `"$VAR"` inside the script
+   expands to a literal string that is never re-parsed as code. There is
+   simply nothing left to break out of.
+2. **Allowlist validation** (`backend/src/claude/tool-input-validation.ts`)
+   on every scalar and every tag key/value, using each cloud's real naming
+   rules. This is belt-and-braces for the shell, but it does real work for
+   the **JMESPath** query strings: `--query "[?tags.\"k\"=='v']"` is data,
+   not code, yet a stray quote there would still rewrite the meaning of the
+   query. The tag charset deliberately excludes quotes, backticks, `$`,
+   `;` and backslash for exactly that reason.
+
+**How the tests hold the line.** `custom-tools.test.ts` calls the exported
+command builders and asserts the supplied values appear in `dockerArgs`
+but *never* in `shellScript`. If someone later "simplifies" a builder by
+interpolating a value back into the script, those tests fail.
+
+**Passing tag pairs without re-introducing the problem** was the fiddly
+bit. `az tag update --tags k1=v1 k2=v2` needs each pair as a separate
+argument, and tag values may legally contain spaces. The script therefore
+receives them newline-delimited in one env var, sets `IFS` to a newline,
+and does `set -- $DEPLOY_TAG_PAIRS` to load them into the positional
+parameters — then passes `"$@"`. Splitting on newlines rather than spaces
+is what keeps a value like `owner=Steven Johnston` in one piece.
+
+### 11.2 Secrets are forwarded by name, not by value (#11–#13)
+
+`docker run -e AZURE_CLIENT_SECRET=<the actual secret>` puts the secret on
+a command line, and command lines are world-readable: `ps auxww`,
+`/proc/<pid>/cmdline`, `docker inspect`, process accounting. Since the
+backend already has these variables in its own environment (compose gives
+it `env_file: .env`), the flags are now **name-only** — `-e
+AZURE_CLIENT_SECRET` — and docker forwards the value over its API instead.
+Same for `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`.
+
+Side effect worth knowing: `custom-tools.ts` no longer imports `config.ts`
+at all, because it no longer needs the secret *values*. It only needs the
+names. A test asserts no secret value appears anywhere in a generated argv.
+
+Non-secret per-call values (region, resource group, deployment name) still
+travel as `-e NAME=value`, which is fine — the concern is disclosure, not
+injection, and argv is not a shell.
+
+### 11.3 `destroy_azure` is now plan-then-confirm (#8–#10)
+
+**The problem.** In tag-filter mode the tool listed every resource group in
+the *subscription* matching the tags and deleted each one with
+`--yes --no-wait`. The only guard was "at least one non-empty tag", so a
+single generic tag was enough to sweep everything the service principal
+could see — and `--no-wait` meant it was gone before anyone could react.
+
+**Three guards, all enforced before anything is deleted:**
+
+- **Project anchor.** A tag-filter destroy must include a non-empty
+  `mcp-project` (or legacy `azure-mcp-project`) tag. An unanchored filter
+  is refused outright. The explicit `resource_group_name` mode is already
+  specific, so it's unaffected by this rule.
+- **Dry run by default.** `destroy_azure` now takes `confirm`. Without it,
+  the tool runs only the *listing* half — it reports exactly which resource
+  groups and standalone resources it would delete, and deletes nothing.
+  Deletion needs a second call with `confirm: true`. The tool description,
+  the teardown system prompt, the scheduler's teardown guard, and the
+  frontend's tear-down prompt all walk the model through plan → check →
+  confirm.
+- **Sanity cap.** If the filter matches more than `AZURE_MCP_DESTROY_MAX_GROUPS`
+  resource groups (default 25), the confirmed run refuses and prints the
+  list rather than deleting, on the assumption the filter is wrong. The cap
+  check is emitted *before* the delete loop in the script.
+
+**Chose to be stricter than the issue required:** issue #8 would have
+allowed the explicit-resource-group path to skip confirmation. It doesn't —
+every destroy is plan-then-confirm. One rule is easier for the model to
+follow reliably than a rule with an exception, and the dry run for a named
+group is genuinely useful (it lists what's inside before it goes).
+
+**One frontend consequence.** `useChat` decides whether to flip a topology
+row to "destroyed" by looking at the last `destroy_azure` result of the
+turn. A dry run succeeds without deleting anything, so that check now
+requires `confirm: true` on the call — otherwise a plan-only turn would
+have marked live resources as torn down.
+
+**Not extended to `destroy_aws`.** The issues scoped this to Azure, and
+`destroy_aws` deletes named CloudFormation stacks rather than sweeping a
+subscription, so the blast radius is smaller. Worth mirroring later.
+
+### 11.4 Lifecycle stages are enforced in code, not prose (#5–#7)
+
+The stage rule ("deploy in push, delete in teardown, everything else is
+read-only") existed only as an instruction in the system prompt. The model
+was the only thing enforcing it, and the stage arrives on a
+client-controlled request field. `backend/src/claude/tool-stages.ts` is now
+the single source of truth, used in two independent places:
+
+1. `getClaudeTools(cloud, stage)` filters the list, so during a build/view/
+   free turn the model is never even shown a mutating tool.
+2. `callMcpTool(name, input, stage)` re-checks at dispatch and refuses with
+   `is_error: true` before any container spawns — so a stale prompt cache
+   or a hand-crafted request can't slip one through either.
+
+**Classifying 100+ upstream MCP tools we don't name.** Our own four are
+matched by name. The rest are classified by the verb in the tool name
+(`azmcp_group_delete` → destroy, `azmcp_storage_account_create` →
+mutating, `azmcp_group_list` → read-only). A *trailing* read-only verb
+wins, so `azmcp_deploy_plan_get` reads a plan rather than looking like a
+deployment. Anything that shells out to an arbitrary CLI (the `extension_az`
+passthrough tools) is always treated as mutating, because its name tells
+you nothing about what it will do. Unknown verbs default to read-only —
+the inspection tools dominate that bucket and anything dangerous names its
+verb.
+
+**How to audit the classifier:** the backend logs one line per cloud+stage
+the first time it builds a list — `[tools] azure:build: N tools available,
+M withheld as mutating`. `GET /api/mcp/tools?stage=push` shows the exact
+list for any stage. If something read-only gets withheld, add an exact-name
+exception rather than widening the verb rules.
+
+**Prompt-cache note:** the tool list is part of the cached prompt prefix,
+so keying it per cloud+stage creates a few more cache variants (2 clouds ×
+5 stages at worst) instead of two. Each stays byte-stable, so each stays
+warm — they just warm up independently. That is the accepted cost;
+leaving mutating tools in the list to preserve one prefix is not an option.
+
+### 11.5 Incidental fix: the scheduler used the wrong tag key
+
+Not from the issue list, but found while touching this code. The
+interactive chat tags resources `mcp-project=<name>`, but the scheduler's
+prompts said `azure-mcp-project=<name>` — so scheduled deploys were tagged
+with a key nothing queries, and scheduled tear-downs filtered on a key
+nothing carries (i.e. they would have found and deleted nothing). The
+scheduler now uses `mcp-project` throughout, matching the rest of the tool.
+
+### 11.6 Testing
+
+`npm test` in `backend/` runs `node --test` over `src/**/*.test.ts` via
+tsx — 45 tests, no cloud access and no containers spawned. Tests are
+excluded from `tsconfig.json` so they never reach `dist/`; `npm run
+typecheck` type-checks them via `tsconfig.test.json`.

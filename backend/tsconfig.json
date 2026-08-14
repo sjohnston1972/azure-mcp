@@ -15,5 +15,9 @@
     "sourceMap": true,
     "noUncheckedIndexedAccess": true
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  // Tests run from source via tsx (`npm test`) and have no business in
+  // the production image, so they're kept out of the dist build.
+  // `npm run typecheck` still checks them — see the tsconfig.test.json.
+  "exclude": ["src/**/*.test.ts"]
 }

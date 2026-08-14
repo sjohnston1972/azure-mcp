@@ -5,14 +5,22 @@
 // the AWS MCP tools + custom tools. The cache is keyed per-cloud
 // so flipping the toggle doesn't invalidate the other side's cache.
 //
+// Stage aware too: the list is filtered by the lifecycle stage of the
+// turn (see tool-stages.ts), so during a build/view/free turn the model
+// is never shown a tool that can change or delete anything. That makes
+// the stage rule structural rather than advisory.
+//
 // MCP tool definitions already use JSON Schema, so the conversion is a
 // near-1:1 rename of fields. We cache the converted list once per
-// cloud because:
+// cloud+stage because:
 //   1. Re-fetching tools on every request would burn time on a docker
 //      stdio round-trip we don't need.
 //   2. The tool list is part of the cached Anthropic prompt prefix —
 //      changing it (different ordering, added tools) would invalidate
 //      the prompt cache and force a re-write.
+// Keying the cache by cloud+stage means a handful of distinct cached
+// prefixes (2 clouds × 5 stages at worst) instead of two. Each one stays
+// byte-stable, so each stays warm; they just warm up independently.
 
 import type Anthropic from "@anthropic-ai/sdk";
 import { getMcpClient } from "../mcp/client.js";
@@ -24,10 +32,20 @@ import {
   callCustomTool,
   isCustomTool,
 } from "./custom-tools.js";
+import {
+  isToolAllowedInStage,
+  stageRefusalMessage,
+  type ChatStage,
+} from "./tool-stages.js";
 
 type ToolOwner = "azure" | "bicep" | "aws";
 
-const cachedToolsByCloud: Record<Cloud, Anthropic.Tool[] | null> = {
+/** Cache key is `${cloud}:${stage}` — see the note at the top of the file. */
+const cachedToolsByCloudStage = new Map<string, Anthropic.Tool[]>();
+
+/** Unfiltered per-cloud list, so switching stage doesn't re-spawn the MCP
+ *  stdio round-trip. Filtering is cheap and pure; fetching is not. */
+const cachedRawToolsByCloud: Record<Cloud, Anthropic.Tool[] | null> = {
   azure: null,
   aws: null,
 };
@@ -73,11 +91,41 @@ function splitCustomToolsByCloud(): {
 
 /**
  * Returns the combined tool list given to Claude for the requested
- * cloud. Sorted by name so the rendered prompt prefix is byte-stable
- * across backend restarts and the Anthropic prompt cache stays warm.
+ * cloud and lifecycle stage. Sorted by name so the rendered prompt prefix
+ * is byte-stable across backend restarts and the Anthropic prompt cache
+ * stays warm.
+ *
+ * Mutating tools are dropped in read-only stages — see tool-stages.ts for
+ * the rule and `callMcpTool` for the second, independent check.
  */
-export async function getClaudeTools(cloud: Cloud): Promise<Anthropic.Tool[]> {
-  const cached = cachedToolsByCloud[cloud];
+export async function getClaudeTools(
+  cloud: Cloud,
+  stage: ChatStage
+): Promise<Anthropic.Tool[]> {
+  const key = `${cloud}:${stage}`;
+  const cached = cachedToolsByCloudStage.get(key);
+  if (cached) return cached;
+
+  const raw = await loadRawTools(cloud);
+  const list = raw.filter((t) => isToolAllowedInStage(t.name, stage));
+
+  // Log what the stage filter removed, once per cloud+stage. The
+  // classifier works off tool-name verbs (we don't control upstream
+  // naming), so this is how you audit that it got them right — check
+  // `docker compose logs backend` after a turn in each stage.
+  const dropped = raw.length - list.length;
+  // eslint-disable-next-line no-console
+  console.log(
+    `[tools] ${key}: ${list.length} tools available, ${dropped} withheld as mutating`
+  );
+
+  cachedToolsByCloudStage.set(key, list);
+  return list;
+}
+
+/** Fetch + convert every tool for a cloud, unfiltered. Cached per cloud. */
+async function loadRawTools(cloud: Cloud): Promise<Anthropic.Tool[]> {
+  const cached = cachedRawToolsByCloud[cloud];
   if (cached) return cached;
 
   const { azure: azureCustom, aws: awsCustom, shared } = splitCustomToolsByCloud();
@@ -108,7 +156,7 @@ export async function getClaudeTools(cloud: Cloud): Promise<Anthropic.Tool[]> {
     const list = [...awsTools, ...awsCustom, ...shared].sort((a, b) =>
       a.name.localeCompare(b.name)
     );
-    cachedToolsByCloud.aws = list;
+    cachedRawToolsByCloud.aws = list;
     return list;
   }
 
@@ -153,7 +201,7 @@ export async function getClaudeTools(cloud: Cloud): Promise<Anthropic.Tool[]> {
     ...azureCustom,
     ...shared,
   ].sort((a, b) => a.name.localeCompare(b.name));
-  cachedToolsByCloud.azure = list;
+  cachedRawToolsByCloud.azure = list;
   return list;
 }
 
@@ -165,14 +213,30 @@ export async function getClaudeTools(cloud: Cloud): Promise<Anthropic.Tool[]> {
  * resource. Anthropic's tool_result accepts a string OR an array of
  * text/image blocks — same shape for the common case, so we pass it
  * through. If `isError` is set on the MCP response we propagate it.
+ *
+ * `stage` is the lifecycle stage of the turn. It is checked here, before
+ * anything runs, independently of the stage filter applied to the tool
+ * list — so a stale prompt cache or a hand-crafted request still can't
+ * get a mutation through in a read-only stage.
  */
 export async function callMcpTool(
   name: string,
-  input: unknown
+  input: unknown,
+  stage: ChatStage
 ): Promise<{
   content: string | Anthropic.ToolResultBlockParam["content"];
   is_error: boolean;
 }> {
+  // ── Stage authorization ──────────────────────────────────────────
+  // Fail closed: refuse before any container spawns or any cloud API is
+  // touched. The caller still gets a well-formed tool_result, so the
+  // Anthropic message sequence stays valid and the loop continues.
+  if (!isToolAllowedInStage(name, stage)) {
+    // eslint-disable-next-line no-console
+    console.warn(`[tools] REFUSED '${name}' in stage '${stage}'`);
+    return { content: stageRefusalMessage(name, stage), is_error: true };
+  }
+
   // In-process custom tool (e.g. deploy_bicep, deploy_cloudformation)
   // — handle locally, never round-trip to an MCP server.
   if (isCustomTool(name)) {

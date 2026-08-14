@@ -10,14 +10,43 @@
 // official `mcr.microsoft.com/azure-cli` container with the project's
 // service-principal credentials and running `az deployment ... create`.
 
+// ── A note on how values reach the container ──────────────────────
+//
+// Nothing that comes from a tool call is ever pasted into the `sh -c`
+// script text. The script bodies below are static: they only ever
+// reference `"$SOME_VAR"`. The values arrive separately as `docker run -e`
+// flags, and docker passes those through verbatim — no shell parses them
+// on the way in, and `"$VAR"` inside the script expands to a literal
+// string that is never re-parsed as code. That makes shell injection
+// structurally impossible rather than merely unlikely.
+//
+// On top of that, every scalar and tag is allowlist-validated before a
+// container is spawned (see tool-input-validation.ts). Belt and braces:
+// the env-var passing is the real fix, the validation also protects the
+// JMESPath query strings, where a stray quote would change the query's
+// meaning even though it could never execute anything.
+//
+// Secrets are passed by NAME only (`-e AZURE_CLIENT_SECRET`, no `=value`).
+// Docker forwards the value from this process's own environment, so the
+// secret never appears in the sidecar's argv where `ps` and
+// `docker inspect` would expose it.
+
 import type Anthropic from "@anthropic-ai/sdk";
 import { spawn } from "node:child_process";
 import { writeFile, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { config } from "../config.js";
 import { CURATED_VM_SKUS } from "../lib/vm-skus.js";
 import { CURATED_EC2_TYPES } from "../lib/ec2-types.js";
+import {
+  requireProjectAnchor,
+  validateAwsRegion,
+  validateAzureLocation,
+  validateAzureResourceGroup,
+  validateDeploymentName,
+  validateStackName,
+  validateTags,
+} from "./tool-input-validation.js";
 
 const AZURE_CLI_IMAGE =
   process.env.AZURE_CLI_IMAGE ?? "mcr.microsoft.com/azure-cli:latest";
@@ -63,6 +92,58 @@ const AWS_PROFILE = process.env.AWS_PROFILE ?? "";
 const AWS_AUTH_CONFIGURED =
   Boolean(AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY) ||
   Boolean(AWS_HOST_CONFIG_PATH);
+
+/**
+ * Safety cap on a tag-filter destroy: if the filter matches more resource
+ * groups than this, we refuse and print the list instead of deleting.
+ * A filter that sweeps up 30 resource groups is almost certainly wrong,
+ * and the service principal usually has rights over the whole
+ * subscription. Raise via env if you genuinely run projects that large.
+ */
+const DESTROY_MAX_GROUPS = Number(
+  process.env.AZURE_MCP_DESTROY_MAX_GROUPS ?? "25"
+);
+
+/**
+ * Azure credential flags for `docker run`, passed by NAME so the secret
+ * value never lands on the sidecar's command line (where any process on
+ * the host could read it via `ps` or `docker inspect`).
+ *
+ * The values come from this process's environment, which config.ts has
+ * already verified is populated — the backend exits at boot if any of
+ * these are missing, so by the time a tool runs they are guaranteed
+ * present. We re-check anyway and fail with a clear message rather than
+ * spawning a container that would only fail at `az login`.
+ */
+const AZURE_CRED_ENV_NAMES = [
+  "AZURE_TENANT_ID",
+  "AZURE_CLIENT_ID",
+  "AZURE_CLIENT_SECRET",
+  "AZURE_SUBSCRIPTION_ID",
+] as const;
+
+function azureCredDockerArgs(): { args: string[] } | { error: string } {
+  const missing = AZURE_CRED_ENV_NAMES.filter((n) => !process.env[n]);
+  if (missing.length > 0) {
+    return {
+      error:
+        `Azure credentials are not available to the backend process: ${missing.join(", ")} ` +
+        `is unset. Fill these in .env and restart the backend.`,
+    };
+  }
+  // `-e NAME` with no `=value` tells docker "forward this variable from
+  // my own environment" — the value is transferred over the docker API,
+  // not through the argv.
+  return { args: AZURE_CRED_ENV_NAMES.flatMap((n) => ["-e", n]) };
+}
+
+/** Same idea for AWS. Returns the name-only `-e` flags for whichever
+ *  credential variables are actually set. */
+function awsCredDockerArgs(): string[] {
+  const args: string[] = ["-e", "AWS_ACCESS_KEY_ID", "-e", "AWS_SECRET_ACCESS_KEY"];
+  if (AWS_SESSION_TOKEN) args.push("-e", "AWS_SESSION_TOKEN");
+  return args;
+}
 
 export const CUSTOM_TOOLS: Anthropic.Tool[] = [
   {
@@ -116,7 +197,8 @@ export const CUSTOM_TOOLS: Anthropic.Tool[] = [
   {
     name: "destroy_azure",
     description:
-      "Delete Azure resources. Use this for tear-down — the Azure MCP Server has no resource-group-delete or generic delete-by-tag tool. This tool spawns Microsoft's official azure-cli container with the project's service-principal credentials and runs `az group delete` and/or `az resource delete --ids` against matched resources. Two operating modes: (1) `resource_group_name` to delete a specific resource group (cascades to all resources inside); (2) `tag_filters` to delete every resource group AND every standalone resource that carries ALL the listed tags. The two modes can be combined. Returns the deletion summary verbatim.",
+      "Delete Azure resources. Use this for tear-down — the Azure MCP Server has no resource-group-delete or generic delete-by-tag tool. This tool spawns Microsoft's official azure-cli container with the project's service-principal credentials and runs `az group delete` and/or `az resource delete --ids` against matched resources. Two operating modes: (1) `resource_group_name` to delete a specific resource group (cascades to all resources inside); (2) `tag_filters` to delete every resource group AND every standalone resource that carries ALL the listed tags. The two modes can be combined. " +
+      "ALWAYS A TWO-STEP CALL: the first call (no `confirm`) is a dry run that returns the exact list of resource groups and resources that WOULD be deleted and deletes nothing. Read that list, check it matches what the user asked for, then call again with identical arguments plus `confirm: true` to actually delete. A tag-filter destroy must include the project tag (`mcp-project`) — an unanchored filter is refused, because it could match resources across the whole subscription.",
     input_schema: {
       type: "object",
       properties: {
@@ -128,8 +210,13 @@ export const CUSTOM_TOOLS: Anthropic.Tool[] = [
         tag_filters: {
           type: "object",
           description:
-            "Tag key→value pairs. Resources matching ALL of these tags are deleted. Typical values: { 'azure-mcp-project': '<name>', 'azure-mcp-topology-id': '<uuid>' } for a per-topology destroy.",
+            "Tag key→value pairs. Resources matching ALL of these tags are deleted. MUST include the project anchor tag `mcp-project`. Typical values: { 'mcp-project': '<name>', 'mcp-topology-id': '<uuid>' } for a per-topology destroy.",
           additionalProperties: { type: "string" },
+        },
+        confirm: {
+          type: "boolean",
+          description:
+            "Set false (or omit) for the dry run — the tool lists what it would delete and deletes nothing. Set true ONLY on a follow-up call, after you have seen the dry-run list and it matches the user's intent. Never set true on the first call for a given teardown.",
         },
       },
     },
@@ -560,15 +647,21 @@ async function runValidateBicep(input: BicepSource): Promise<{
     // No `az login` needed — `az bicep build` is purely local. We
     // build to /dev/null because we only care about compile output,
     // not the resulting ARM JSON.
+    // The path is built from a UUID plus a FILENAME_RE-checked name, so
+    // it's already safe — but it still travels as an env var so that the
+    // "no tool input in script text" rule holds for every `sh -c` in this
+    // file without exception.
     const dockerArgs = [
       "run",
       "--rm",
       "-v",
       `${WORKSPACE_VOLUME}:/work`,
+      "-e",
+      `VALIDATE_ENTRY=${entryWorkPath}`,
       AZURE_CLI_IMAGE,
       "sh",
       "-c",
-      `az bicep build --file "${entryWorkPath}" --stdout > /dev/null`,
+      `az bicep build --file "$VALIDATE_ENTRY" --stdout > /dev/null`,
     ];
 
     const result = await spawnAndCapture("docker", dockerArgs, {
@@ -598,131 +691,224 @@ async function runValidateBicep(input: BicepSource): Promise<{
 type DestroyAzureInput = {
   resource_group_name?: string;
   tag_filters?: Record<string, string>;
+  /** When falsy, the tool only reports what it WOULD delete. */
+  confirm?: boolean;
 };
 
-async function runDestroy(input: DestroyAzureInput): Promise<{
-  content: string;
-  is_error: boolean;
-}> {
+/**
+ * Build the docker args + shell script for a destroy_azure call.
+ *
+ * Split out from `runDestroy` so tests can inspect exactly what would be
+ * executed without spawning anything. Two invariants this function is
+ * responsible for, both covered by tests:
+ *   - `shellScript` contains no caller-supplied text, only `$VAR` refs.
+ *   - `dockerArgs` contains no secret VALUES, only `-e NAME` passthroughs.
+ */
+export function buildDestroyAzureCommand(
+  input: DestroyAzureInput
+): { dockerArgs: string[]; shellScript: string; willDelete: boolean } | { error: string } {
   const targetRG = input.resource_group_name?.trim();
   const tags = input.tag_filters ?? {};
-  const tagEntries = Object.entries(tags).filter(([k, v]) => k && v);
+  const tagEntries = Object.entries(tags).filter(([k, v]) => k && v) as [
+    string,
+    string,
+  ][];
+  const confirm = input.confirm === true;
 
   if (!targetRG && tagEntries.length === 0) {
     return {
-      content:
+      error:
         "destroy_azure requires either `resource_group_name` or non-empty `tag_filters`",
-      is_error: true,
     };
   }
 
-  // Build a tag-query string Azure understands. The CLI uses
-  // `tagName=value` repeated; the resource graph filter we use below
-  // joins them with ANDs.
-  // We do the work inside the sidecar via a single shell script so a
-  // single `az login` covers the whole sequence and we get one
-  // consolidated stdout/stderr blob.
+  // ── Validation ────────────────────────────────────────────────
+  // Runs before anything is built, so a bad input never reaches docker.
+  const validationError =
+    validateAzureResourceGroup("resource_group_name", targetRG) ??
+    validateTags("tag_filters", input.tag_filters) ??
+    // A tag-filter destroy sweeps the whole subscription looking for
+    // matches, so it must be anchored to one project. See issue #9.
+    (tagEntries.length > 0
+      ? requireProjectAnchor("tag_filters", tagEntries)
+      : null);
+  if (validationError) return { error: validationError };
+
+  const creds = azureCredDockerArgs();
+  if ("error" in creds) return { error: creds.error };
+
+  // ── Environment handed to the container ──────────────────────
+  // Everything dynamic lives here. Nothing below interpolates it into
+  // the script text.
+  const env: Record<string, string> = {
+    DESTROY_MAX_GROUPS: String(DESTROY_MAX_GROUPS),
+  };
+  if (targetRG) env.DESTROY_RG = targetRG;
+  if (tagEntries.length > 0) {
+    env.DESTROY_TAGS_DESC = tagEntries.map(([k, v]) => `${k}=${v}`).join(", ");
+    // `az group list` returns every RG the SP can see; the CLI's --tag
+    // flag only handles one tag, so we AND the filters in JMESPath
+    // client-side. Tag keys and values are validated above, so neither
+    // can terminate the JMESPath string literals.
+    const jmesCond = tagEntries
+      .map(([k, v]) => `tags."${k}"=='${v}'`)
+      .join(" && ");
+    env.DESTROY_JMES_GROUPS = `[?${jmesCond}].name`;
+    env.DESTROY_JMES_RESOURCES = `[?${jmesCond}] | [].id`;
+  }
+
   const lines: string[] = [
     `set -e`,
     `az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" --output none`,
     `az account set --subscription "$AZURE_SUBSCRIPTION_ID"`,
-    `echo "## destroy_azure plan"`,
-    targetRG ? `echo "specific RG: ${targetRG}"` : "",
-    tagEntries.length > 0
-      ? `echo "tag filters: ${tagEntries.map(([k, v]) => `${k}=${v}`).join(", ")}"`
-      : "",
+    confirm
+      ? `echo "## destroy_azure — EXECUTING (confirm=true)"`
+      : `echo "## destroy_azure — DRY RUN (confirm not set; nothing will be deleted)"`,
+    `if [ -n "$DESTROY_RG" ]; then echo "target resource group: $DESTROY_RG"; fi`,
+    `if [ -n "$DESTROY_TAGS_DESC" ]; then echo "tag filters: $DESTROY_TAGS_DESC"; fi`,
   ];
 
   if (tagEntries.length > 0) {
-    // Find all resource groups whose tags include EVERY filter, list
-    // their names, delete each. `az group list` returns all RGs; we
-    // filter client-side via JMESPath for "tags has key && tag==value
-    // for each entry" — the CLI's --tag flag only handles a single tag.
-    const jmesParts = tagEntries.map(
-      ([k, v]) => `tags.\\"${k}\\"=='${v}'`
-    );
-    const jmes = `[?${jmesParts.join(" && ")}].name`;
+    // Always list first, in both modes — the dry run needs the list, and
+    // the confirmed run needs it to know what to delete and to check the
+    // safety cap.
     lines.push(
       `echo ""`,
-      `echo "## matching resource groups"`,
-      `RGS=$(az group list --query "${jmes}" -o tsv)`,
+      `echo "## resource groups matching the tag filter"`,
+      `RGS=$(az group list --query "$DESTROY_JMES_GROUPS" -o tsv)`,
       `if [ -z "$RGS" ]; then echo "(none)"; else echo "$RGS"; fi`,
-      `for RG in $RGS; do`,
-      `  echo "deleting RG: $RG"`,
-      `  az group delete --name "$RG" --yes --no-wait || true`,
-      `done`,
+      // grep -c exits 1 on no match, which `set -e` would treat as fatal.
+      `RG_COUNT=$(printf '%s\\n' "$RGS" | grep -c . || true)`,
+      `echo "matched resource groups: $RG_COUNT"`,
       `echo ""`,
-      `echo "## standalone resources matching tags (those whose containing RG is NOT being deleted)"`,
-      `RES=$(az resource list --query "${jmes.replace("[?", "[?")} | [].id" -o tsv)`,
-      `if [ -z "$RES" ]; then echo "(none)"; else`,
-      `  echo "$RES"`,
-      `  echo "$RES" | xargs -r az resource delete --ids || true`,
-      `fi`
+      `echo "## standalone resources matching the tag filter"`,
+      `RES=$(az resource list --query "$DESTROY_JMES_RESOURCES" -o tsv)`,
+      `if [ -z "$RES" ]; then echo "(none)"; else echo "$RES"; fi`
     );
+    if (confirm) {
+      lines.push(
+        // Sanity cap. A filter matching dozens of resource groups is
+        // almost certainly wrong, and the blast radius is "everything
+        // the service principal can see".
+        `if [ "$RG_COUNT" -gt "$DESTROY_MAX_GROUPS" ]; then`,
+        `  echo ""`,
+        `  echo "REFUSED: the tag filter matched $RG_COUNT resource groups, above the safety cap of $DESTROY_MAX_GROUPS."`,
+        `  echo "Nothing was deleted. Narrow the tag filter, or raise AZURE_MCP_DESTROY_MAX_GROUPS if a teardown this large is genuinely intended."`,
+        `  exit 3`,
+        `fi`,
+        `echo ""`,
+        `echo "## deleting matched resource groups"`,
+        `for RG in $RGS; do`,
+        `  echo "deleting RG: $RG"`,
+        `  az group delete --name "$RG" --yes --no-wait || true`,
+        `done`,
+        `if [ -n "$RES" ]; then`,
+        `  echo ""`,
+        `  echo "## deleting standalone resources"`,
+        `  echo "$RES" | xargs -r az resource delete --ids || true`,
+        `fi`
+      );
+    }
   }
 
   if (targetRG) {
-    lines.push(
-      `echo ""`,
-      `echo "## explicit RG delete: ${targetRG}"`,
-      `az group delete --name "${targetRG}" --yes --no-wait || true`
-    );
+    if (confirm) {
+      lines.push(
+        `echo ""`,
+        `echo "## deleting resource group $DESTROY_RG"`,
+        `az group delete --name "$DESTROY_RG" --yes --no-wait || true`
+      );
+    } else {
+      lines.push(
+        `echo ""`,
+        `echo "## resource group $DESTROY_RG (would be deleted, with everything in it)"`,
+        // `if <cmd>` is exempt from `set -e`, so a missing RG is reported
+        // rather than aborting the dry run.
+        `if az group show --name "$DESTROY_RG" -o none 2>/dev/null; then`,
+        `  az resource list -g "$DESTROY_RG" --query "[].id" -o tsv || true`,
+        `else`,
+        `  echo "(resource group does not exist)"`,
+        `fi`
+      );
+    }
   }
 
-  // Wait for any --no-wait deletions to actually finish before we
-  // return — otherwise Claude will report "deleted" while Azure is
-  // still working on it. We poll until nothing matches.
-  if (tagEntries.length > 0) {
-    const jmesParts = tagEntries.map(
-      ([k, v]) => `tags.\\"${k}\\"=='${v}'`
-    );
-    const jmes = `[?${jmesParts.join(" && ")}].name`;
+  // Wait for the --no-wait deletions to actually finish before we return
+  // — otherwise Claude reports "deleted" while Azure is still working.
+  // Only relevant on a confirmed run; a dry run deletes nothing.
+  if (confirm && tagEntries.length > 0) {
     lines.push(
       `echo ""`,
       `echo "## waiting for deletions to complete"`,
       `for i in $(seq 1 60); do`,
-      `  REMAINING=$(az group list --query "${jmes}" -o tsv 2>/dev/null || echo "")`,
+      `  REMAINING=$(az group list --query "$DESTROY_JMES_GROUPS" -o tsv 2>/dev/null || echo "")`,
       `  if [ -z "$REMAINING" ]; then echo "all matching RGs gone"; break; fi`,
       `  echo "still pending: $REMAINING"; sleep 10`,
       `done`
     );
   }
-  if (targetRG) {
+  if (confirm && targetRG) {
     lines.push(
       `echo ""`,
-      `echo "## waiting for ${targetRG} to be gone"`,
+      `echo "## waiting for $DESTROY_RG to be gone"`,
       `for i in $(seq 1 60); do`,
-      `  if ! az group show --name "${targetRG}" -o none 2>/dev/null; then echo "${targetRG} gone"; break; fi`,
+      `  if ! az group show --name "$DESTROY_RG" -o none 2>/dev/null; then echo "$DESTROY_RG gone"; break; fi`,
       `  sleep 10`,
       `done`
     );
   }
 
-  const shellScript = lines.filter(Boolean).join("\n");
+  if (!confirm) {
+    lines.push(
+      `echo ""`,
+      `echo "## DRY RUN COMPLETE — nothing was deleted."`,
+      `echo "To delete the items listed above, call destroy_azure again with the same arguments plus confirm: true."`
+    );
+  }
+
+  const shellScript = lines.join("\n");
 
   const dockerArgs = [
     "run",
     "--rm",
-    "-e",
-    `AZURE_TENANT_ID=${config.AZURE_TENANT_ID}`,
-    "-e",
-    `AZURE_CLIENT_ID=${config.AZURE_CLIENT_ID}`,
-    "-e",
-    `AZURE_CLIENT_SECRET=${config.AZURE_CLIENT_SECRET}`,
-    "-e",
-    `AZURE_SUBSCRIPTION_ID=${config.AZURE_SUBSCRIPTION_ID}`,
+    // Secrets by name only — no values on the argv.
+    ...creds.args,
+    // Non-secret dynamic values, passed as literal strings docker hands
+    // to the container. These never touch a shell on the way in.
+    ...Object.entries(env).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
     AZURE_CLI_IMAGE,
     "sh",
     "-c",
     shellScript,
   ];
 
-  const result = await spawnAndCapture("docker", dockerArgs, {
+  return { dockerArgs, shellScript, willDelete: confirm };
+}
+
+async function runDestroy(input: DestroyAzureInput): Promise<{
+  content: string;
+  is_error: boolean;
+}> {
+  const built = buildDestroyAzureCommand(input);
+  if ("error" in built) {
+    return { content: built.error, is_error: true };
+  }
+
+  const result = await spawnAndCapture("docker", built.dockerArgs, {
     timeoutMs: 30 * 60 * 1000,
   });
 
+  const heading = built.willDelete
+    ? `# destroy_azure — DELETE executed (exit ${result.code})`
+    : `# destroy_azure — DRY RUN, nothing deleted (exit ${result.code})`;
+
+  const footer = built.willDelete
+    ? ""
+    : "**This was a dry run.** Nothing has been deleted. Show the user the list above; " +
+      "if it is what they want removed, call `destroy_azure` again with the same arguments plus `confirm: true`.";
+
   const summary = [
-    `# destroy_azure — exit ${result.code}`,
+    heading,
     ``,
     "## stdout",
     "```",
@@ -731,6 +917,7 @@ async function runDestroy(input: DestroyAzureInput): Promise<{
     result.stderr.trim().length > 0
       ? `## stderr\n\n\`\`\`\n${result.stderr.slice(-3000)}\n\`\`\``
       : "",
+    footer,
   ]
     .filter(Boolean)
     .join("\n");
@@ -745,6 +932,124 @@ type DeployBicepInput = BicepSource & {
   deployment_name?: string;
   required_tags?: Record<string, string>;
 };
+
+/**
+ * Build the docker args + shell script for an `az deployment ... create`.
+ *
+ * Every dynamic value — region, resource group, deployment name, template
+ * path, and each required tag — is handed to the container as an
+ * environment variable. The script text below is entirely static, so
+ * there is nothing for a hostile value to break out of.
+ *
+ * Exported so tests can assert those invariants without spawning docker.
+ */
+export function buildBicepDeployCommand(opts: {
+  scope: "subscription" | "resourceGroup";
+  location?: string;
+  resourceGroupName?: string;
+  deploymentName: string;
+  entryWorkPath: string;
+  requiredTags?: Record<string, string>;
+}): { dockerArgs: string[]; shellScript: string } | { error: string } {
+  const creds = azureCredDockerArgs();
+  if ("error" in creds) return { error: creds.error };
+
+  const tagPairs = Object.entries(opts.requiredTags ?? {}).filter(
+    ([k, v]) => k && v
+  );
+
+  const env: Record<string, string> = {
+    DEPLOY_NAME: opts.deploymentName,
+    DEPLOY_ENTRY: opts.entryWorkPath,
+  };
+  if (opts.location) env.DEPLOY_LOCATION = opts.location;
+  if (opts.resourceGroupName) env.DEPLOY_RG = opts.resourceGroupName;
+  // Newline-delimited `key=value` pairs. The script splits on newlines
+  // (not spaces) so a tag value containing a space survives intact.
+  if (tagPairs.length > 0) {
+    env.DEPLOY_TAG_PAIRS = tagPairs.map(([k, v]) => `${k}=${v}`).join("\n");
+  }
+
+  const isSub = opts.scope === "subscription";
+  const azCmd = isSub
+    ? `az deployment sub create --location "$DEPLOY_LOCATION" --template-file "$DEPLOY_ENTRY" --name "$DEPLOY_NAME"`
+    : `az deployment group create --resource-group "$DEPLOY_RG" --template-file "$DEPLOY_ENTRY" --name "$DEPLOY_NAME"`;
+  const showCmd = isSub
+    ? `az deployment sub show --name "$DEPLOY_NAME"`
+    : `az deployment group show --resource-group "$DEPLOY_RG" --name "$DEPLOY_NAME"`;
+
+  // Post-deploy tag enforcement. We list the deployment's outputResources
+  // and `az tag update --operation Merge` each one, so the required tags
+  // are guaranteed regardless of what the Bicep template wrote. Idempotent
+  // — Merge updates the value if the key exists, adds it if not, and
+  // leaves other tags alone.
+  const tagBlock =
+    tagPairs.length === 0
+      ? `echo "(no required_tags supplied — skipping tag enforcement)"`
+      : [
+          // Load the tag pairs into the positional parameters so they can
+          // be passed as separate arguments via "$@". IFS is a literal
+          // newline for the duration of the split.
+          `OLDIFS=$IFS`,
+          `IFS='\n'`,
+          `set -- $DEPLOY_TAG_PAIRS`,
+          `IFS=$OLDIFS`,
+          // Capture deployment-output resource ids — for sub-scoped
+          // deployments these are the resource groups; for group-scoped
+          // they're the individual resources. Either way we walk them.
+          `RIDS=$(${showCmd} --query "properties.outputResources[].id" -o tsv 2>/dev/null || echo "")`,
+          `if [ -z "$RIDS" ]; then echo "(no output resources to tag)"; else`,
+          `  echo "$RIDS" | while read -r rid; do`,
+          `    [ -z "$rid" ] && continue`,
+          `    echo "tagging $rid"`,
+          `    az tag update --resource-id "$rid" --operation Merge --tags "$@" -o none || echo "  (warn: tag update failed for $rid)"`,
+          `  done`,
+          `  # Also apply tags directly to any resource group named in the deployment.`,
+          `  echo "$RIDS" | grep -i "/resourcegroups/" | grep -ivE "/providers/" | while read -r rgid; do`,
+          `    [ -z "$rgid" ] && continue`,
+          // The azure-cli image is alpine-based and does NOT ship awk by
+          // default; using `cut` keeps this portable across image updates.
+          `    rgname=$(echo "$rgid" | cut -d/ -f5)`,
+          `    echo "applying tags to RG $rgname (and child resources)"`,
+          `    az tag update --resource-id "$rgid" --operation Merge --tags "$@" -o none || true`,
+          `    # Cascade to every resource in the RG so tag-filter destroy can find them.`,
+          `    az resource list -g "$rgname" --query "[].id" -o tsv | while read -r rid; do`,
+          `      [ -z "$rid" ] && continue`,
+          `      az tag update --resource-id "$rid" --operation Merge --tags "$@" -o none || true`,
+          `    done`,
+          `  done`,
+          `fi`,
+        ].join("\n");
+
+  const shellScript = [
+    `set -e`,
+    // Login as the SP (these env vars come from --env passthrough).
+    `az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" --output none`,
+    `az account set --subscription "$AZURE_SUBSCRIPTION_ID"`,
+    `echo "## az deployment"`,
+    `${azCmd} --output json`,
+    `echo ""`,
+    `echo "## tag enforcement"`,
+    `set +e`,
+    tagBlock,
+  ].join("\n");
+
+  const dockerArgs = [
+    "run",
+    "--rm",
+    "-v",
+    `${WORKSPACE_VOLUME}:/work`,
+    // Secrets by name only — no values on the argv.
+    ...creds.args,
+    ...Object.entries(env).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
+    AZURE_CLI_IMAGE,
+    "sh",
+    "-c",
+    shellScript,
+  ];
+
+  return { dockerArgs, shellScript };
+}
 
 async function runBicepDeploy(input: DeployBicepInput): Promise<{
   content: string;
@@ -761,6 +1066,19 @@ async function runBicepDeploy(input: DeployBicepInput): Promise<{
     errors.push("`location` is required when scope='subscription'");
   if (input.scope === "resourceGroup" && !input.resource_group_name)
     errors.push("`resource_group_name` is required when scope='resourceGroup'");
+
+  // Allowlist every value that will reach the sidecar. These are also
+  // passed as env vars rather than script text (see buildBicepDeployCommand),
+  // so this is the second layer — but it fails fast, with a message the
+  // model can act on, before we spend time on pre-flight compilation.
+  const invalid = [
+    validateAzureLocation("location", input.location),
+    validateAzureResourceGroup("resource_group_name", input.resource_group_name),
+    validateDeploymentName("deployment_name", input.deployment_name),
+    validateTags("required_tags", input.required_tags),
+  ].filter((e): e is string => e !== null);
+  errors.push(...invalid);
+
   if (errors.length > 0) {
     return { content: errors.join("\n"), is_error: true };
   }
@@ -806,93 +1124,19 @@ async function runBicepDeploy(input: DeployBicepInput): Promise<{
 
   try {
     // 2. Build the az command and spawn the azure-cli container.
-    const azCmd =
-      input.scope === "subscription"
-        ? `az deployment sub create --location "${input.location}" --template-file "${entryWorkPath}" --name "${id}"`
-        : `az deployment group create --resource-group "${input.resource_group_name}" --template-file "${entryWorkPath}" --name "${id}"`;
+    const built = buildBicepDeployCommand({
+      scope: input.scope,
+      location: input.location,
+      resourceGroupName: input.resource_group_name,
+      deploymentName: id,
+      entryWorkPath,
+      requiredTags: input.required_tags,
+    });
+    if ("error" in built) {
+      return { content: built.error, is_error: true };
+    }
 
-    // Build the post-deploy tag-enforcement step. We list the
-    // deployment's outputResources, then `az tag update --operation
-    // Merge` each one so the required tags are guaranteed regardless
-    // of what the Bicep template wrote. Idempotent — Merge updates the
-    // value if the key exists, adds it if not, leaves other tags alone.
-    const tagPairs = Object.entries(input.required_tags ?? {}).filter(
-      ([k, v]) => k && v
-    );
-    const showCmd =
-      input.scope === "subscription"
-        ? `az deployment sub show --name "${id}"`
-        : `az deployment group show --resource-group "${input.resource_group_name}" --name "${id}"`;
-    const tagBlock =
-      tagPairs.length === 0
-        ? `echo "(no required_tags supplied — skipping tag enforcement)"`
-        : [
-            // Capture deployment-output resource ids — for sub-scoped
-            // deployments these are the resource groups; for group-scoped
-            // they're the individual resources. Either way we walk them.
-            `RIDS=$(${showCmd} --query "properties.outputResources[].id" -o tsv 2>/dev/null || echo "")`,
-            `if [ -z "$RIDS" ]; then echo "(no output resources to tag)"; else`,
-            `  echo "$RIDS" | while read -r rid; do`,
-            `    [ -z "$rid" ] && continue`,
-            `    echo "tagging $rid"`,
-            `    az tag update --resource-id "$rid" --operation Merge --tags ${tagPairs
-              .map(([k, v]) => `'${k}=${v}'`)
-              .join(" ")} -o none || echo "  (warn: tag update failed for $rid)"`,
-            `  done`,
-            `  # Also apply tags directly to any resource group named in the deployment.`,
-            `  echo "$RIDS" | grep -i "/resourcegroups/" | grep -ivE "/providers/" | while read -r rgid; do`,
-            `    [ -z "$rgid" ] && continue`,
-            // The azure-cli image is alpine-based and does NOT ship awk by
-            // default; using `cut` keeps this portable across image updates.
-            `    rgname=$(echo "$rgid" | cut -d/ -f5)`,
-            `    echo "applying tags to RG $rgname (and child resources)"`,
-            `    az tag update --resource-id "$rgid" --operation Merge --tags ${tagPairs
-              .map(([k, v]) => `'${k}=${v}'`)
-              .join(" ")} -o none || true`,
-            `    # Cascade to every resource in the RG so tag-filter destroy can find them.`,
-            `    az resource list -g "$rgname" --query "[].id" -o tsv | while read -r rid; do`,
-            `      [ -z "$rid" ] && continue`,
-            `      az tag update --resource-id "$rid" --operation Merge --tags ${tagPairs
-              .map(([k, v]) => `'${k}=${v}'`)
-              .join(" ")} -o none || true`,
-            `    done`,
-            `  done`,
-            `fi`,
-          ].join("\n");
-
-    const shellScript = [
-      `set -e`,
-      // Login as the SP (these env vars come from --env passthrough).
-      `az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" --output none`,
-      `az account set --subscription "$AZURE_SUBSCRIPTION_ID"`,
-      `echo "## az deployment"`,
-      `${azCmd} --output json`,
-      `echo ""`,
-      `echo "## tag enforcement"`,
-      `set +e`,
-      tagBlock,
-    ].join("\n");
-
-    const dockerArgs = [
-      "run",
-      "--rm",
-      "-v",
-      `${WORKSPACE_VOLUME}:/work`,
-      "-e",
-      `AZURE_TENANT_ID=${config.AZURE_TENANT_ID}`,
-      "-e",
-      `AZURE_CLIENT_ID=${config.AZURE_CLIENT_ID}`,
-      "-e",
-      `AZURE_CLIENT_SECRET=${config.AZURE_CLIENT_SECRET}`,
-      "-e",
-      `AZURE_SUBSCRIPTION_ID=${config.AZURE_SUBSCRIPTION_ID}`,
-      AZURE_CLI_IMAGE,
-      "sh",
-      "-c",
-      shellScript,
-    ];
-
-    const result = await spawnAndCapture("docker", dockerArgs, {
+    const result = await spawnAndCapture("docker", built.dockerArgs, {
       timeoutMs: 30 * 60 * 1000, // 30 minute hard cap on a single deployment
     });
 
@@ -1032,12 +1276,13 @@ function awsCliDockerArgs(extraEnv: Record<string, string> = {}): string[] {
   // Pass IAM access keys when configured. These take precedence
   // over any ~/.aws mount because they're more deterministic
   // (no SSO refresh window, no profile lookup).
+  //
+  // Passed by NAME (`-e AWS_SECRET_ACCESS_KEY`, no `=value`): docker
+  // forwards the value from this process's environment, so the key never
+  // appears on the sidecar's command line where `ps auxww` or
+  // `docker inspect` would show it.
   if (AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY) {
-    args.push("-e", `AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}`);
-    args.push("-e", `AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`);
-    if (AWS_SESSION_TOKEN) {
-      args.push("-e", `AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}`);
-    }
+    args.push(...awsCredDockerArgs());
   } else if (AWS_HOST_CONFIG_PATH) {
     // SSO fallback: mount the host's ~/.aws into the sidecar.
     args.push("-v", `${AWS_HOST_CONFIG_PATH}:/root/.aws:ro`);
@@ -1130,12 +1375,18 @@ async function runDeployCloudFormation(input: DeployCfnInput): Promise<{
       is_error: true,
     };
   }
-  if (!input.stack_name || !/^[a-zA-Z][a-zA-Z0-9-]{0,127}$/.test(input.stack_name)) {
-    return {
-      content:
-        "`stack_name` is required and must be 1–128 chars: letter, then alphanumerics + dashes (CloudFormation rules).",
-      is_error: true,
-    };
+  // Validate everything that reaches the aws CLI. These go on the argv
+  // as separate arguments (no shell involved), but a bad region or stack
+  // name should fail fast with a message the model can act on, and the
+  // tags end up on the stack where the destroy-by-tag flow reads them.
+  const cfnErrors = [
+    input.stack_name ? null : "`stack_name` is required.",
+    validateStackName("stack_name", input.stack_name),
+    validateAwsRegion("region", input.region),
+    validateTags("required_tags", input.required_tags),
+  ].filter((e): e is string => e !== null);
+  if (cfnErrors.length > 0) {
+    return { content: cfnErrors.join("\n"), is_error: true };
   }
   // Pre-flight validate so we never attempt a CFN deploy on a
   // template that won't parse — same defence-in-depth as Bicep.
@@ -1246,6 +1497,133 @@ type DestroyAwsInput = {
   region?: string;
 };
 
+/**
+ * Build the docker args + shell script for a destroy_aws call.
+ *
+ * Same contract as the Azure builders: static script text, every dynamic
+ * value handed over as an environment variable, secrets by name only.
+ * Exported for tests.
+ */
+export function buildDestroyAwsCommand(
+  input: DestroyAwsInput
+): { dockerArgs: string[]; shellScript: string } | { error: string } {
+  const stack = input.stack_name?.trim();
+  const tags = input.tag_filters ?? {};
+  const tagEntries = Object.entries(tags).filter(([k, v]) => k && v) as [
+    string,
+    string,
+  ][];
+  if (!stack && tagEntries.length === 0) {
+    return {
+      error: "destroy_aws requires either `stack_name` or non-empty `tag_filters`",
+    };
+  }
+
+  const validationError =
+    validateStackName("stack_name", stack) ??
+    validateAwsRegion("region", input.region) ??
+    validateTags("tag_filters", input.tag_filters);
+  if (validationError) return { error: validationError };
+
+  const region = input.region ?? AWS_DEFAULT_REGION;
+
+  const env: Record<string, string> = { DESTROY_REGION: region };
+  if (stack) env.DESTROY_STACK = stack;
+  if (tagEntries.length > 0) {
+    env.DESTROY_TAGS_DESC = tagEntries.map(([k, v]) => `${k}=${v}`).join(", ");
+    // describe-stacks returns each tag as { Key, Value }, so matching ALL
+    // filters means ANDing one sub-filter per pair. Keys and values are
+    // validated above, so neither can terminate the JMESPath literals.
+    const conds = tagEntries
+      .map(([k, v]) => `Tags[?Key=='${k}' && Value=='${v}']`)
+      .join(" && ");
+    env.DESTROY_STACK_JMES = `Stacks[?${conds}].StackName`;
+  }
+
+  const lines: string[] = [
+    `set -e`,
+    `echo "## destroy_aws"`,
+    `if [ -n "$DESTROY_STACK" ]; then echo "target stack: $DESTROY_STACK"; fi`,
+    `if [ -n "$DESTROY_TAGS_DESC" ]; then echo "tag filters: $DESTROY_TAGS_DESC"; fi`,
+  ];
+
+  if (tagEntries.length > 0) {
+    lines.push(
+      `echo ""`,
+      `echo "## matching stacks"`,
+      `STACKS=$(aws cloudformation describe-stacks --region "$DESTROY_REGION" --query "$DESTROY_STACK_JMES" --output text 2>/dev/null || echo "")`,
+      `if [ -z "$STACKS" ]; then echo "(none)"; else echo "$STACKS"; fi`,
+      `for S in $STACKS; do`,
+      `  echo "deleting stack: $S"`,
+      `  aws cloudformation delete-stack --region "$DESTROY_REGION" --stack-name "$S" || true`,
+      `done`
+    );
+  }
+  if (stack) {
+    lines.push(
+      `echo ""`,
+      `echo "## explicit stack delete: $DESTROY_STACK"`,
+      `aws cloudformation delete-stack --region "$DESTROY_REGION" --stack-name "$DESTROY_STACK" || true`
+    );
+  }
+
+  // Wait for deletions to complete.
+  if (tagEntries.length > 0) {
+    lines.push(
+      `echo ""`,
+      `echo "## waiting for stack deletions to complete"`,
+      `for i in $(seq 1 60); do`,
+      `  REMAINING=$(aws cloudformation describe-stacks --region "$DESTROY_REGION" --query "$DESTROY_STACK_JMES" --output text 2>/dev/null || echo "")`,
+      `  if [ -z "$REMAINING" ]; then echo "all matching stacks gone"; break; fi`,
+      `  echo "still pending: $REMAINING"; sleep 10`,
+      `done`
+    );
+  }
+  if (stack) {
+    lines.push(
+      `echo ""`,
+      `echo "## waiting for $DESTROY_STACK to be gone"`,
+      `for i in $(seq 1 60); do`,
+      `  if ! aws cloudformation describe-stacks --region "$DESTROY_REGION" --stack-name "$DESTROY_STACK" >/dev/null 2>&1; then echo "$DESTROY_STACK gone"; break; fi`,
+      `  sleep 10`,
+      `done`
+    );
+  }
+
+  const shellScript = lines.join("\n");
+
+  // The aws-cli image's ENTRYPOINT is `aws`, so running a shell script
+  // needs `--entrypoint /bin/sh`; the script then arrives as the
+  // entrypoint's `-c` argument. Auth precedence matches the rest of the
+  // AWS path: access keys first, fall back to the ~/.aws mount.
+  const useAccessKeys =
+    Boolean(AWS_ACCESS_KEY_ID) && Boolean(AWS_SECRET_ACCESS_KEY);
+  const dockerArgs = [
+    "run",
+    "--rm",
+    "-v",
+    `${WORKSPACE_VOLUME}:/work`,
+    // Secrets by name only — no values on the argv.
+    ...(useAccessKeys
+      ? awsCredDockerArgs()
+      : AWS_HOST_CONFIG_PATH
+        ? ["-v", `${AWS_HOST_CONFIG_PATH}:/root/.aws:ro`]
+        : []),
+    ...(!useAccessKeys && AWS_PROFILE ? ["-e", "AWS_PROFILE"] : []),
+    ...Object.entries(env).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
+    // The CLI also reads AWS_DEFAULT_REGION when a command omits --region.
+    "-e",
+    `AWS_DEFAULT_REGION=${region}`,
+    "--entrypoint",
+    "/bin/sh",
+    AWS_CLI_IMAGE,
+    "-c",
+    shellScript,
+  ];
+
+  return { dockerArgs, shellScript };
+}
+
 async function runDestroyAws(input: DestroyAwsInput): Promise<{
   content: string;
   is_error: boolean;
@@ -1257,136 +1635,13 @@ async function runDestroyAws(input: DestroyAwsInput): Promise<{
       is_error: true,
     };
   }
-  const stack = input.stack_name?.trim();
-  const tags = input.tag_filters ?? {};
-  const tagEntries = Object.entries(tags).filter(([k, v]) => k && v);
-  if (!stack && tagEntries.length === 0) {
-    return {
-      content:
-        "destroy_aws requires either `stack_name` or non-empty `tag_filters`",
-      is_error: true,
-    };
+
+  const built = buildDestroyAwsCommand(input);
+  if ("error" in built) {
+    return { content: built.error, is_error: true };
   }
 
-  const region = input.region ?? AWS_DEFAULT_REGION;
-  const lines: string[] = [
-    `set -e`,
-    `echo "## destroy_aws plan"`,
-    stack ? `echo "specific stack: ${stack}"` : "",
-    tagEntries.length > 0
-      ? `echo "tag filters: ${tagEntries.map(([k, v]) => `${k}=${v}`).join(", ")}"`
-      : "",
-  ];
-
-  if (tagEntries.length > 0) {
-    // Find every CFN stack whose tags include EVERY filter pair.
-    // describe-stacks JMES filters: each tag is { Key, Value }, so
-    // we need an `[? ... && ...]` expression that ANDs them.
-    const conds = tagEntries
-      .map(([k, v]) => `Tags[?Key=='${k}' && Value=='${v}']`)
-      .join(" && ");
-    lines.push(
-      `echo ""`,
-      `echo "## matching stacks"`,
-      // CFN active stacks only (skip already-deleted ones via filter).
-      `STACKS=$(aws cloudformation describe-stacks --region "${region}" --query "Stacks[?${conds}].StackName" --output text 2>/dev/null || echo "")`,
-      `if [ -z "$STACKS" ]; then echo "(none)"; else echo "$STACKS"; fi`,
-      `for S in $STACKS; do`,
-      `  echo "deleting stack: $S"`,
-      `  aws cloudformation delete-stack --region "${region}" --stack-name "$S" || true`,
-      `done`
-    );
-  }
-  if (stack) {
-    lines.push(
-      `echo ""`,
-      `echo "## explicit stack delete: ${stack}"`,
-      `aws cloudformation delete-stack --region "${region}" --stack-name "${stack}" || true`
-    );
-  }
-
-  // Wait for deletions to complete.
-  if (tagEntries.length > 0) {
-    const conds = tagEntries
-      .map(([k, v]) => `Tags[?Key=='${k}' && Value=='${v}']`)
-      .join(" && ");
-    lines.push(
-      `echo ""`,
-      `echo "## waiting for stack deletions to complete"`,
-      `for i in $(seq 1 60); do`,
-      `  REMAINING=$(aws cloudformation describe-stacks --region "${region}" --query "Stacks[?${conds}].StackName" --output text 2>/dev/null || echo "")`,
-      `  if [ -z "$REMAINING" ]; then echo "all matching stacks gone"; break; fi`,
-      `  echo "still pending: $REMAINING"; sleep 10`,
-      `done`
-    );
-  }
-  if (stack) {
-    lines.push(
-      `echo ""`,
-      `echo "## waiting for ${stack} to be gone"`,
-      `for i in $(seq 1 60); do`,
-      `  if ! aws cloudformation describe-stacks --region "${region}" --stack-name "${stack}" >/dev/null 2>&1; then echo "${stack} gone"; break; fi`,
-      `  sleep 10`,
-      `done`
-    );
-  }
-
-  const shellScript = lines.filter(Boolean).join("\n");
-  const dockerArgs = [
-    ...awsCliDockerArgs({ AWS_DEFAULT_REGION: region, AWS_PROFILE }),
-    "--",
-    "sh",
-    "-c",
-    shellScript,
-  ];
-  // The aws-cli image's ENTRYPOINT is `aws`. To run a shell we need
-  // `--entrypoint /bin/sh` (or use the `aws` ENTRYPOINT for single
-  // commands). Override entrypoint here so we can run a shell script.
-  // We rebuild the args list because awsCliDockerArgs already
-  // appended the IMAGE — splice an --entrypoint right before it.
-  const imgIdx = dockerArgs.indexOf(AWS_CLI_IMAGE);
-  if (imgIdx >= 0) {
-    dockerArgs.splice(imgIdx, 0, "--entrypoint", "/bin/sh");
-  }
-  // Now the `--` and `sh -c` we pushed at the end conflict with the
-  // overridden entrypoint. Drop the literal "--" and "sh" tokens
-  // we appended; the entrypoint /bin/sh will be invoked directly
-  // with `-c <script>` as its arg.
-  // Rebuild cleanly to avoid bugs. Auth precedence matches the rest
-  // of the AWS path: access keys first, fall back to ~/.aws mount.
-  const useAccessKeys =
-    Boolean(AWS_ACCESS_KEY_ID) && Boolean(AWS_SECRET_ACCESS_KEY);
-  const finalArgs = [
-    "run",
-    "--rm",
-    "-v",
-    `${WORKSPACE_VOLUME}:/work`,
-    ...(useAccessKeys
-      ? [
-          "-e",
-          `AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}`,
-          "-e",
-          `AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`,
-          ...(AWS_SESSION_TOKEN
-            ? ["-e", `AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}`]
-            : []),
-        ]
-      : AWS_HOST_CONFIG_PATH
-        ? ["-v", `${AWS_HOST_CONFIG_PATH}:/root/.aws:ro`]
-        : []),
-    "-e",
-    `AWS_DEFAULT_REGION=${region}`,
-    ...(!useAccessKeys && AWS_PROFILE
-      ? ["-e", `AWS_PROFILE=${AWS_PROFILE}`]
-      : []),
-    "--entrypoint",
-    "/bin/sh",
-    AWS_CLI_IMAGE,
-    "-c",
-    shellScript,
-  ];
-
-  const result = await spawnAndCapture("docker", finalArgs, {
+  const result = await spawnAndCapture("docker", built.dockerArgs, {
     timeoutMs: 30 * 60 * 1000,
   });
   const summary = [

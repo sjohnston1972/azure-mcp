@@ -27,10 +27,9 @@ import {
   type Cloud,
 } from "../claude/system-prompt.js";
 import { callMcpTool, getClaudeTools } from "../claude/tool-bridge.js";
+import type { ChatStage } from "../claude/tool-stages.js";
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
-
-type ChatStage = "build" | "view" | "push" | "teardown" | "free";
 
 type ChatBody = {
   messages: Anthropic.MessageParam[];
@@ -43,6 +42,10 @@ type ChatBody = {
   stage?: ChatStage;
 };
 
+/** The only stage values we accept from the client. Anything else is
+ *  treated as "build" (the most restrictive stage). */
+const VALID_STAGES: ChatStage[] = ["build", "view", "push", "teardown", "free"];
+
 const STAGE_GUARD: Record<ChatStage, string> = {
   build:
     "## Active stage: BUILD\n\nThe user is designing — propose only. Do NOT call any mutating Azure MCP tools. End your response with `<topology>{...}</topology>` and `<bicep>...</bicep>` markers describing what you're proposing.",
@@ -51,7 +54,7 @@ const STAGE_GUARD: Record<ChatStage, string> = {
   push:
     "## Active stage: PUSH\n\nDeploy the architecture you previously designed. Use Azure MCP tools to execute the Bicep, or call the underlying create/deploy tools directly. Tag every resource with `azure-mcp-project=<project name>`. After the deployment finishes, emit an updated `<topology>` marker with `status` reflecting actual outcomes (`success` or `failed`).",
   teardown:
-    "## Active stage: TEAR-DOWN\n\nDelete the targeted Azure resources. Find them via MCP tag-query tools and remove them. Typically the cleanest path is to delete the resource group(s) carrying the matching tag(s), since deletion cascades. After teardown, emit `<topology>{\"nodes\":[],\"edges\":[]}</topology>`. The active project block tells you whether this is a project-wide tear-down (filter by `azure-mcp-project` only) or a per-topology destroy (filter by BOTH `azure-mcp-project` AND `azure-mcp-topology-id`).",
+    "## Active stage: TEAR-DOWN\n\nDelete the targeted Azure resources. Typically the cleanest path is to delete the resource group(s) carrying the matching tag(s), since deletion cascades. `destroy_azure` is a TWO-STEP call: first without `confirm` (a dry run that lists what would be deleted and deletes nothing), then again with the same arguments plus `confirm: true` once you have checked the list matches the user's intent. After teardown, emit `<topology>{\"nodes\":[],\"edges\":[]}</topology>`. The active project block tells you whether this is a project-wide tear-down (filter by `mcp-project` only) or a per-topology destroy (filter by BOTH `mcp-project` AND `mcp-topology-id`). Deploy tools are unavailable in this stage.",
   free:
     "## Active stage: FREE\n\nThe user is asking an ad-hoc question outside the build/push lifecycle. Default to read-only — only mutate Azure if they explicitly ask. Topology and Bicep markers are not required.",
 };
@@ -183,9 +186,18 @@ export async function chatRoutes(app: FastifyInstance) {
       }
     }
 
+    // Resolve the stage BEFORE loading tools — the tool list is filtered
+    // by stage, so read-only turns never see a deploy or destroy tool.
+    // `stage` arrives from the client, so anything unrecognised collapses
+    // to the most restrictive stage rather than being trusted (it would
+    // also let a caller pollute the per-stage tool cache with junk keys).
+    const stage: ChatStage = VALID_STAGES.includes(body.stage as ChatStage)
+      ? (body.stage as ChatStage)
+      : "build";
+
     let tools: Anthropic.Tool[];
     try {
-      tools = await getClaudeTools(projectCloud);
+      tools = await getClaudeTools(projectCloud, stage);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       sse("error", { message: `failed to load MCP tools: ${message}` });
@@ -208,7 +220,6 @@ export async function chatRoutes(app: FastifyInstance) {
 
     // Per-request stage guard. Goes after the cache breakpoint so
     // changing stage doesn't invalidate the cached prefix.
-    const stage: ChatStage = body.stage ?? "build";
     systemBlocks.push({ type: "text", text: STAGE_GUARD[stage] });
 
     if (body.project_id) {
@@ -223,8 +234,8 @@ export async function chatRoutes(app: FastifyInstance) {
             const teardownNote =
               stage === "teardown"
                 ? body.topology_id
-                  ? `\n**This is a per-topology destroy.** Call \`destroy_azure\` with \`tag_filters: { "mcp-project": "${p.name}", "mcp-topology-id": "${body.topology_id}" }\`. Do NOT delete resources that lack the mcp-topology-id tag — they belong to other topologies in this project.\n`
-                  : `\n**This is a project-wide tear-down.** Call \`destroy_azure\` with \`tag_filters: { "mcp-project": "${p.name}" }\`.\n`
+                  ? `\n**This is a per-topology destroy.** Call \`destroy_azure\` with \`tag_filters: { "mcp-project": "${p.name}", "mcp-topology-id": "${body.topology_id}" }\` — first without \`confirm\` to see the dry-run list, then again with the same filters plus \`confirm: true\`. Do NOT delete resources that lack the mcp-topology-id tag — they belong to other topologies in this project.\n`
+                  : `\n**This is a project-wide tear-down.** Call \`destroy_azure\` with \`tag_filters: { "mcp-project": "${p.name}" }\` — first without \`confirm\` to see the dry-run list, then again with the same filters plus \`confirm: true\`.\n`
                 : "";
             systemBlocks.push({
               type: "text",
@@ -336,7 +347,10 @@ export async function chatRoutes(app: FastifyInstance) {
         const toolResults: Anthropic.ToolResultBlockParam[] = [];
         for (const t of toolUses) {
           sse("tool_use", { id: t.id, name: t.name, input: t.input });
-          const r = await callMcpTool(t.name, t.input);
+          // `stage` is passed so the dispatcher can refuse a mutating
+          // tool outright — a second, independent check on top of the
+          // stage-filtered tool list above.
+          const r = await callMcpTool(t.name, t.input, stage);
 
           // Send a content preview to the frontend so the user can
           // expand the tool block and see what actually came back.

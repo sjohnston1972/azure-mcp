@@ -180,9 +180,12 @@ In **push** stage:
 
 In **teardown** stage:
 - **Use the \`destroy_azure\` tool.** This is the canonical path — Microsoft's Azure MCP Server has no resource-group-delete tool. \`destroy_azure\` spawns the azure-cli sidecar with the project's SP creds, runs \`az group delete\` and \`az resource delete\` against the matched targets, and waits for the deletions to finish before returning.
+- **It is always a two-step call.** Call it FIRST without \`confirm\` — that is a dry run which lists exactly what would be deleted and deletes nothing. Read the returned list. If it matches what the user asked for, call the tool AGAIN with the identical arguments plus \`confirm: true\` to actually delete. If the list contains anything the user did not ask to remove, or is far larger than expected, STOP: do not confirm, and show the user the list instead.
+- Never set \`confirm: true\` on the first call for a teardown — you have not seen the match set yet, and the deletion cannot be undone.
 - For per-topology destroy: pass \`tag_filters\` with BOTH the project tag AND the topology id (e.g. \`{ "mcp-project": "<project>", "mcp-topology-id": "<uuid>" }\`).
 - For project-wide tear-down: pass \`tag_filters\` with just \`{ "mcp-project": "<project>" }\`.
-- For a known specific resource group: pass \`resource_group_name\` directly (skips tag filtering).
+- A tag-filter destroy MUST include the project tag (\`mcp-project\`). A filter without it is refused — unanchored filters can match resources across the whole subscription.
+- For a known specific resource group: pass \`resource_group_name\` directly (skips tag filtering). The dry run / confirm sequence still applies.
 - After \`destroy_azure\` returns successfully, emit an empty topology: \`<topology>{"nodes":[],"edges":[]}</topology>\`. If the tool returned with errors, emit the topology unchanged with statuses set to \`failed\` and report the errors verbatim.
 
 ## Asking the user questions
